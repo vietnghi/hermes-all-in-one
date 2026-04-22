@@ -1,34 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 240" width="900" height="240">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0a0f1d"/>
-      <stop offset="100%" stop-color="#111827"/>
-    </linearGradient>
-    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#4f46e5"/>
-      <stop offset="100%" stop-color="#7c3aed"/>
-    </linearGradient>
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="8" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-  </defs>
-  <rect width="900" height="240" fill="url(#bg)" rx="18"/>
-  <rect x="1" y="1" width="898" height="238" fill="none" stroke="#243041" stroke-width="1.5" rx="17.5"/>
-  <circle cx="56" cy="120" r="34" fill="url(#accent)" filter="url(#glow)" opacity="0.9"/>
-  <text x="56" y="127" text-anchor="middle" font-family="ui-monospace,monospace" font-size="26" font-weight="800" fill="white">H</text>
-  <text x="108" y="108" font-family="ui-sans-serif,system-ui,sans-serif" font-size="32" font-weight="800" fill="#e5e7eb" letter-spacing="-0.5">Hermes</text>
-  <text x="108" y="138" font-family="ui-sans-serif,system-ui,sans-serif" font-size="16" font-weight="400" fill="#94a3b8">All-in-One · Railway Template</text>
-  <line x1="108" y1="152" x2="580" y2="152" stroke="#243041" stroke-width="1"/>
-  <text x="108" y="174" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" fill="#6b7280">One container. One volume. One Hermes identity.</text>
-  <text x="108" y="194" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" fill="#6b7280">Telegram + WebUI + Admin — all on the same brain.</text>
-  <rect x="640" y="88" width="220" height="36" rx="10" fill="url(#accent)" opacity="0.15" stroke="#4f46e5" stroke-width="1"/>
-  <text x="750" y="111" text-anchor="middle" font-family="ui-monospace,monospace" font-size="12" fill="#a5b4fc">/ → WebUI</text>
-  <rect x="640" y="132" width="220" height="36" rx="10" fill="url(#accent)" opacity="0.15" stroke="#4f46e5" stroke-width="1"/>
-  <text x="750" y="155" text-anchor="middle" font-family="ui-monospace,monospace" font-size="12" fill="#a5b4fc">/admin → Control Plane</text>
-  <rect x="640" y="176" width="220" height="36" rx="10" fill="url(#accent)" opacity="0.15" stroke="#4f46e5" stroke-width="1"/>
-  <text x="750" y="199" text-anchor="middle" font-family="ui-monospace,monospace" font-size="12" fill="#a5b4fc">/health → Railway check</text>
-</svg>
+<img src="assets/banner.svg" width="900" alt="Hermes All-in-One · Railway Template">
 
 # Hermes All-in-One · Railway Template
 
