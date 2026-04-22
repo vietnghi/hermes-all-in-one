@@ -1,0 +1,41 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Backup and temporary files
+*.bak
+*.swp
+*.swo
+
+# Archive directory (pre-git backups, kept on disk but not tracked)
+archive/
+
+# Local environment and secrets (but keep the example template)
+.env
+.env.*
+!.env.example
+.claude/
+CLAUDE.md
+AGENTS.md
+.cursorrules
+.windsurfrules
+.aider*
+copilot-instructions.md
+
+# Generated screenshots and transient artifacts
+screenshot-*.png
+full-UI.png
+
+# Version file written by Docker/CI build — generated, never committed
+api/_version.py
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local reference clones — never committed (except tracked design/UI-UX reference pages)
+docs/*
+!docs/ui-ux/
+!docs/ui-ux/**
