@@ -37,9 +37,13 @@ Everything shares one Hermes identity — the same memory, skills, config, and S
 
 ## Screenshots
 
-| Control Plane Overview | Provider Setup | Channel Config |
-|----------------------|----------------|---------------|
-| _(screenshot)_ | _(screenshot)_ | _(screenshot)_ |
+**Admin Control Plane** — `/admin`
+
+![Hermes Control Plane](assets/controlpanel.png)
+
+**Hermes WebUI** — `/`
+
+![Hermes WebUI](assets/hermeswebui.png)
 
 ---
 
