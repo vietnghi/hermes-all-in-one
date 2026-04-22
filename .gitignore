@@ -1,2 +1,19 @@
 .ralph/logs/
 _bmad-output/
+
+# local runtime state
+.env
+data/
+.tmp-smoke-data/
+.tmp-sync/
+logs/
+
+# python noise
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

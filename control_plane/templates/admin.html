@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Control Plane</title>
+    <link rel="stylesheet" href="/admin/static/admin.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">H</div>
+          <div>
+            <div class="brand-title">Hermes Control Plane</div>
+            <div class="brand-subtitle">Railway admin surface</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="nav-link active" data-panel="overview">Overview</button>
+          <button class="nav-link" data-panel="providers">Providers</button>
+          <button class="nav-link" data-panel="channels">Channels</button>
+          <button class="nav-link" data-panel="logs">Logs</button>
+        </nav>
+        <div class="sidebar-footer">
+          <a href="/" class="link-button">Open WebUI</a>
+          <form method="post" action="/admin/logout">
+            <button class="ghost-button" type="submit">Sign out</button>
+          </form>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1>Stable, shared-runtime Hermes</h1>
+            <p>WebUI at <code>/</code>, control plane at <code>/admin</code>, one canonical Hermes home.</p>
+          </div>
+          <div class="topbar-actions">
+            <button class="secondary-button" id="refresh-status" type="button">Refresh</button>
+            <button class="primary-button" id="restart-webui" type="button">Restart WebUI</button>
+          </div>
+        </header>
+
+        <section class="panel active" id="panel-overview">
+          <div class="grid cards-grid">
+            <article class="card metric-card">
+              <span class="eyebrow">Public surface</span>
+              <h2>WebUI</h2>
+              <p id="webui-status-line">Loading…</p>
+            </article>
+            <article class="card metric-card">
+              <span class="eyebrow">Gateway</span>
+              <h2>Messaging runtime</h2>
+              <p id="gateway-status-line">Loading…</p>
+            </article>
+            <article class="card metric-card">
+              <span class="eyebrow">Agent identity</span>
+              <h2>Shared state</h2>
+              <p id="paths-line">Loading…</p>
+            </article>
+          </div>
+
+          <div class="grid two-up">
+            <article class="card">
+              <div class="card-header">
+                <div>
+                  <span class="eyebrow">Runtime</span>
+                  <h3>Gateway lifecycle</h3>
+                </div>
+                <div class="badge" id="gateway-badge">Unknown</div>
+              </div>
+              <p class="muted">Autostart stays honest: Hermes only boots the gateway automatically when both a provider and at least one channel are configured.</p>
+              <div class="button-row">
+                <button class="secondary-button" data-gateway-action="start" type="button">Start</button>
+                <button class="secondary-button" data-gateway-action="stop" type="button">Stop</button>
+                <button class="primary-button" data-gateway-action="restart" type="button">Restart</button>
+              </div>
+            </article>
+
+            <article class="card">
+              <span class="eyebrow">Onboarding stance</span>
+              <h3>Provider policy</h3>
+              <p class="muted">API-key providers are the happy path. Advanced OAuth-style providers remain manual unless a hosted flow is proven robust.</p>
+              <div class="note" id="provider-note">{{ unsupported_provider_note }}</div>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel" id="panel-providers">
+          <article class="card narrow-card">
+            <span class="eyebrow">Providers</span>
+            <h3>API-key-first onboarding</h3>
+            <p class="muted">Set a primary provider and model here. For Codex / ChatGPT-style login, use the advanced manual route outside the browser.</p>
+            <form id="provider-form" class="form-grid">
+              <label>
+                <span>Provider</span>
+                <select name="provider" id="provider-select">
+                  {% for provider in provider_catalog %}
+                  <option value="{{ provider.id }}">{{ provider.label }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>
+                <span>Model</span>
+                <input type="text" name="model" placeholder="anthropic/claude-sonnet-4.6">
+              </label>
+              <label>
+                <span>API key</span>
+                <input type="password" name="api_key" placeholder="sk-…">
+              </label>
+              <label>
+                <span>Base URL (custom only)</span>
+                <input type="text" name="base_url" placeholder="https://your-endpoint/v1">
+              </label>
+              <div class="form-actions">
+                <button class="primary-button" type="submit">Save provider setup</button>
+              </div>
+            </form>
+            <pre class="inline-status" id="provider-form-status"></pre>
+          </article>
+        </section>
+
+        <section class="panel" id="panel-channels">
+          <article class="card">
+            <span class="eyebrow">Channels</span>
+            <h3>Messaging credentials</h3>
+            <p class="muted">Keep Telegram and WebUI as the same Hermes identity by writing channel credentials into the shared Hermes environment.</p>
+            <form id="channel-form" class="form-grid two-columns">
+              <label>
+                <span>Telegram bot token</span>
+                <input type="password" name="TELEGRAM_BOT_TOKEN" placeholder="123456:ABC…">
+              </label>
+              <label>
+                <span>Telegram allowed users</span>
+                <input type="text" name="TELEGRAM_ALLOWED_USERS" placeholder="user1,user2">
+              </label>
+              <label>
+                <span>Discord bot token</span>
+                <input type="password" name="DISCORD_BOT_TOKEN" placeholder="Discord token">
+              </label>
+              <label>
+                <span>Slack bot token</span>
+                <input type="password" name="SLACK_BOT_TOKEN" placeholder="xoxb-…">
+              </label>
+              <label>
+                <span>Slack app token</span>
+                <input type="password" name="SLACK_APP_TOKEN" placeholder="xapp-…">
+              </label>
+              <label>
+                <span>Email address</span>
+                <input type="email" name="EMAIL_ADDRESS" placeholder="agent@example.com">
+              </label>
+              <div class="form-actions full-width">
+                <button class="primary-button" type="submit">Save channel settings</button>
+              </div>
+            </form>
+            <pre class="inline-status" id="channel-form-status"></pre>
+          </article>
+        </section>
+
+        <section class="panel" id="panel-logs">
+          <div class="grid two-up">
+            <article class="card">
+              <span class="eyebrow">Gateway</span>
+              <h3>Recent runtime output</h3>
+              <pre class="log-box" id="gateway-log-box"></pre>
+            </article>
+            <article class="card">
+              <span class="eyebrow">WebUI</span>
+              <h3>Recent internal process output</h3>
+              <pre class="log-box" id="webui-log-box"></pre>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script id="initial-status" type="application/json">{{ status | tojson }}</script>
+    <script src="/admin/static/admin.js"></script>
+  </body>
+</html>
