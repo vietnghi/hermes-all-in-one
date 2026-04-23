@@ -1,9 +1,10 @@
-# BMAD / planning artifacts (internal only)
+# internal tooling — never publish
 _bmad/
 _bmad-output/
+.bmad/
+.claude/
 .ralph/
-docs/plans/
-docs/decisions/
+docs/
 CLAUDE.md
 
 # local runtime state
