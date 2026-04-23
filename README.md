@@ -5,7 +5,7 @@
 > **Browser-based setup at `/admin` — no terminal, no config files.**
 > One container, one shared agent identity across WebUI, Telegram, Discord, and Slack. Persistent memory, built-in skills, cron automations ready on deploy.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/T_b4Si?referralCode=1uw5HI)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/hermes-all-in-one-or-webui-admin-panel-g?referralCode=1uw5HI)
 
 ---
 
