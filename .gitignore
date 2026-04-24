@@ -7,7 +7,6 @@ bmalph/
 .ralph/
 docs/
 CLAUDE.md
-bmalph/
 
 # local runtime state
 .env
