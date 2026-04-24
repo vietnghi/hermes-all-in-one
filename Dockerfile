@@ -1,7 +1,7 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -18,6 +18,7 @@ RUN printf "__version__ = '%s'\n" "$HERMES_WEBUI_VERSION" > /app/vendor/hermes-w
     && uv pip install --system --no-cache -e "/app/vendor/hermes-agent[messaging]" \
     && uv pip install --system --no-cache -r /app/vendor/hermes-webui/requirements.txt \
     && uv pip install --system --no-cache -r /app/requirements-control-plane.txt \
+    && uv pip install --system --no-cache "mcp>=1.24.0" \
     && chmod +x /app/start.sh \
     && mkdir -p /data/.hermes /data/webui /data/workspace \
     && touch /.within_container
