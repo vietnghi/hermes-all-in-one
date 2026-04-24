@@ -2,6 +2,7 @@ import atexit
 import concurrent.futures
 import copy
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -15,10 +16,81 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
+logger = logging.getLogger(__name__)
+
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
 )
+
+
+# ── Panic logger ─────────────────────────────────────────────────────
+# Gateway crashes in a TUI session leave no forensics: stdout is the
+# JSON-RPC pipe (TUI side parses it, doesn't log raw), the root logger
+# only catches handled warnings, and the subprocess exits before stderr
+# flushes through the stderr->gateway.stderr event pump. This hook
+# appends every unhandled exception to ~/.hermes/logs/tui_gateway_crash.log
+# AND re-emits a one-line summary to stderr so the TUI can surface it in
+# Activity — exactly what was missing when the voice-mode turns started
+# exiting the gateway mid-TTS.
+_CRASH_LOG = os.path.join(_hermes_home, "logs", "tui_gateway_crash.log")
+
+
+def _panic_hook(exc_type, exc_value, exc_tb):
+    import traceback
+
+    trace = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
+        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n=== unhandled exception · {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+            )
+            f.write(trace)
+    except Exception:
+        pass
+    # Stderr goes through to the TUI as a gateway.stderr Activity line —
+    # the first line here is what the user will see without opening any
+    # log files.  Rest of the stack is still in the log for full context.
+    first = str(exc_value).strip().splitlines()[0] if str(exc_value).strip() else exc_type.__name__
+    print(f"[gateway-crash] {exc_type.__name__}: {first}", file=sys.stderr, flush=True)
+    # Chain to the default hook so the process still terminates normally.
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+sys.excepthook = _panic_hook
+
+
+def _thread_panic_hook(args):
+    # threading.excepthook signature: SimpleNamespace(exc_type, exc_value, exc_traceback, thread)
+    import traceback
+
+    trace = "".join(
+        traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
+    )
+    try:
+        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
+        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n=== thread exception · {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"· thread={args.thread.name} ===\n"
+            )
+            f.write(trace)
+    except Exception:
+        pass
+    first_line = (
+        str(args.exc_value).strip().splitlines()[0]
+        if str(args.exc_value).strip()
+        else args.exc_type.__name__
+    )
+    print(
+        f"[gateway-crash] thread {args.thread.name} raised {args.exc_type.__name__}: {first_line}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+threading.excepthook = _thread_panic_hook
 
 try:
     from hermes_cli.banner import prefetch_update_check
@@ -34,6 +106,7 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _answers: dict[str, str] = {}
 _db = None
+_db_error: str | None = None
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _cfg_cache: dict | None = None
@@ -170,12 +243,26 @@ atexit.register(
 
 
 def _get_db():
-    global _db
+    global _db, _db_error
     if _db is None:
         from hermes_state import SessionDB
 
-        _db = SessionDB()
+        try:
+            _db = SessionDB()
+            _db_error = None
+        except Exception as exc:
+            _db_error = str(exc)
+            logger.warning(
+                "TUI session store unavailable — continuing without state.db features: %s",
+                exc,
+            )
+            return None
     return _db
+
+
+def _db_unavailable_error(rid, *, code: int):
+    detail = _db_error or "state.db unavailable"
+    return _err(rid, code, f"state.db unavailable: {detail}")
 
 
 def write_json(obj: dict) -> bool:
@@ -453,6 +540,17 @@ def _write_config_key(key_path: str, value):
         current = current[key]
     current[keys[-1]] = value
     _save_cfg(cfg)
+
+
+_STATUSBAR_MODES = frozenset({"off", "top", "bottom"})
+
+
+def _coerce_statusbar(raw) -> str:
+    if raw is False:
+        return "off"
+    if isinstance(raw, str) and (s := raw.strip().lower()) in _STATUSBAR_MODES:
+        return s
+    return "top"
 
 
 def _load_reasoning_config() -> dict | None:
@@ -1113,13 +1211,22 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
 
 def _make_agent(sid: str, key: str, session_id: str | None = None):
     from run_agent import AIAgent
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
     cfg = _load_cfg()
     system_prompt = cfg.get("agent", {}).get("system_prompt", "") or ""
     if not system_prompt:
         system_prompt = _resolve_personality_prompt(cfg)
+    runtime = resolve_runtime_provider(requested=None)
     return AIAgent(
         model=_resolve_model(),
+        provider=runtime.get("provider"),
+        base_url=runtime.get("base_url"),
+        api_key=runtime.get("api_key"),
+        api_mode=runtime.get("api_mode"),
+        acp_command=runtime.get("command"),
+        acp_args=runtime.get("args"),
+        credential_pool=runtime.get("credential_pool"),
         quiet_mode=True,
         verbose_logging=_load_tool_progress_mode() == "verbose",
         reasoning_config=_load_reasoning_config(),
@@ -1318,7 +1425,9 @@ def _(rid, params: dict) -> dict:
             finally:
                 _clear_session_context(tokens)
 
-            _get_db().create_session(key, source="tui", model=_resolve_model())
+            db = _get_db()
+            if db is not None:
+                db.create_session(key, source="tui", model=_resolve_model())
             session["agent"] = agent
 
             try:
@@ -1390,6 +1499,9 @@ def _(rid, params: dict) -> dict:
 
 @method("session.list")
 def _(rid, params: dict) -> dict:
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
     try:
         # Resume picker should include human conversation surfaces beyond
         # tui/cli (notably telegram from blitz row #7), but avoid internal
@@ -1416,7 +1528,7 @@ def _(rid, params: dict) -> dict:
         fetch_limit = max(limit * 5, 100)
         rows = [
             s
-            for s in _get_db().list_sessions_rich(source=None, limit=fetch_limit)
+            for s in db.list_sessions_rich(source=None, limit=fetch_limit)
             if (s.get("source") or "").strip().lower() in allow
         ][:limit]
         return _ok(
@@ -1445,6 +1557,8 @@ def _(rid, params: dict) -> dict:
     if not target:
         return _err(rid, 4006, "session_id required")
     db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5000)
     found = db.get_session(target)
     if not found:
         found = db.get_session_by_title(target)
@@ -1483,13 +1597,16 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5007)
     title, key = params.get("title", ""), session["session_key"]
     if not title:
         return _ok(
-            rid, {"title": _get_db().get_session_title(key) or "", "session_key": key}
+            rid, {"title": db.get_session_title(key) or "", "session_key": key}
         )
     try:
-        _get_db().set_session_title(key, title)
+        db.set_session_title(key, title)
         return _ok(rid, {"title": title})
     except Exception as e:
         return _err(rid, 5007, str(e))
@@ -1625,6 +1742,8 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5008)
     old_key = session["session_key"]
     with session["history_lock"]:
         history = [dict(msg) for msg in session.get("history", [])]
@@ -2076,7 +2195,43 @@ def _(rid, params: dict) -> dict:
             if rendered:
                 payload["rendered"] = rendered
             _emit("message.complete", sid, payload)
+
+            # CLI parity: when voice-mode TTS is on, speak the agent reply
+            # (cli.py:_voice_speak_response).  Only the final text — tool
+            # calls / reasoning already stream separately and would be
+            # noisy to read aloud.
+            if (
+                status == "complete"
+                and isinstance(raw, str)
+                and raw.strip()
+                and _voice_tts_enabled()
+            ):
+                try:
+                    from hermes_cli.voice import speak_text
+
+                    spoken = raw
+                    threading.Thread(
+                        target=speak_text, args=(spoken,), daemon=True
+                    ).start()
+                except ImportError:
+                    logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
+                except Exception as e:
+                    logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            import traceback
+
+            trace = traceback.format_exc()
+            try:
+                os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
+                with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"\n=== turn-dispatcher exception · "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} · sid={sid} ===\n"
+                    )
+                    f.write(trace)
+            except Exception:
+                pass
+            print(f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
             _emit("error", sid, {"message": str(e)})
         finally:
             try:
@@ -2499,12 +2654,11 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"key": key, "value": nv})
 
-    if key in ("compact", "statusbar"):
+    if key == "compact":
         raw = str(value or "").strip().lower()
         cfg0 = _load_cfg()
         d0 = cfg0.get("display") if isinstance(cfg0.get("display"), dict) else {}
-        def_key = "tui_compact" if key == "compact" else "tui_statusbar"
-        cur_b = bool(d0.get(def_key, False if key == "compact" else True))
+        cur_b = bool(d0.get("tui_compact", False))
         if raw in ("", "toggle"):
             nv_b = not cur_b
         elif raw == "on":
@@ -2512,10 +2666,27 @@ def _(rid, params: dict) -> dict:
         elif raw == "off":
             nv_b = False
         else:
-            return _err(rid, 4002, f"unknown {key} value: {value}")
-        _write_config_key(f"display.{def_key}", nv_b)
-        out = "on" if nv_b else "off"
-        return _ok(rid, {"key": key, "value": out})
+            return _err(rid, 4002, f"unknown compact value: {value}")
+        _write_config_key("display.tui_compact", nv_b)
+        return _ok(rid, {"key": key, "value": "on" if nv_b else "off"})
+
+    if key == "statusbar":
+        raw = str(value or "").strip().lower()
+        display = _load_cfg().get("display")
+        d0 = display if isinstance(display, dict) else {}
+        current = _coerce_statusbar(d0.get("tui_statusbar", "top"))
+
+        if raw in ("", "toggle"):
+            nv = "top" if current == "off" else "off"
+        elif raw == "on":
+            nv = "top"
+        elif raw in _STATUSBAR_MODES:
+            nv = raw
+        else:
+            return _err(rid, 4002, f"unknown statusbar value: {value}")
+
+        _write_config_key("display.tui_statusbar", nv)
+        return _ok(rid, {"key": key, "value": nv})
 
     if key in ("prompt", "personality", "skin"):
         try:
@@ -2633,8 +2804,11 @@ def _(rid, params: dict) -> dict:
         on = bool(_load_cfg().get("display", {}).get("tui_compact", False))
         return _ok(rid, {"value": "on" if on else "off"})
     if key == "statusbar":
-        on = bool(_load_cfg().get("display", {}).get("tui_statusbar", True))
-        return _ok(rid, {"value": "on" if on else "off"})
+        display = _load_cfg().get("display")
+        raw = (
+            display.get("tui_statusbar", "top") if isinstance(display, dict) else "top"
+        )
+        return _ok(rid, {"value": _coerce_statusbar(raw)})
     if key == "mtime":
         cfg_path = _hermes_home / "config.yaml"
         try:
@@ -3082,6 +3256,162 @@ def _(rid, params: dict) -> dict:
 
 # ── Methods: complete ─────────────────────────────────────────────────
 
+_FUZZY_CACHE_TTL_S = 5.0
+_FUZZY_CACHE_MAX_FILES = 20000
+_FUZZY_FALLBACK_EXCLUDES = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".next",
+        ".cache",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        "dist",
+        "build",
+        "target",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+)
+_fuzzy_cache_lock = threading.Lock()
+_fuzzy_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def _list_repo_files(root: str) -> list[str]:
+    """Return file paths relative to ``root``.
+
+    Uses ``git ls-files`` from the repo top (resolved via
+    ``rev-parse --show-toplevel``) so the listing covers tracked + untracked
+    files anywhere in the repo, then converts each path back to be relative
+    to ``root``. Files outside ``root`` (parent directories of cwd, sibling
+    subtrees) are excluded so the picker stays scoped to what's reachable
+    from the gateway's cwd. Falls back to a bounded ``os.walk(root)`` when
+    ``root`` isn't inside a git repo. Result cached per-root for
+    ``_FUZZY_CACHE_TTL_S`` so rapid keystrokes don't respawn git processes.
+    """
+    now = time.monotonic()
+    with _fuzzy_cache_lock:
+        cached = _fuzzy_cache.get(root)
+        if cached and now - cached[0] < _FUZZY_CACHE_TTL_S:
+            return cached[1]
+
+    files: list[str] = []
+    try:
+        top_result = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            timeout=2.0,
+            check=False,
+        )
+        if top_result.returncode == 0:
+            top = top_result.stdout.decode("utf-8", "replace").strip()
+            list_result = subprocess.run(
+                ["git", "-C", top, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                capture_output=True,
+                timeout=2.0,
+                check=False,
+            )
+            if list_result.returncode == 0:
+                for p in list_result.stdout.decode("utf-8", "replace").split("\0"):
+                    if not p:
+                        continue
+                    rel = os.path.relpath(os.path.join(top, p), root).replace(os.sep, "/")
+                    # Skip parents/siblings of cwd — keep the picker scoped
+                    # to root-and-below, matching Cmd-P workspace semantics.
+                    if rel.startswith("../"):
+                        continue
+                    files.append(rel)
+                    if len(files) >= _FUZZY_CACHE_MAX_FILES:
+                        break
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    if not files:
+        # Fallback walk: skip vendor/build dirs + dot-dirs so the walk stays
+        # tractable. Dotfiles themselves survive — the ranker decides based
+        # on whether the query starts with `.`.
+        try:
+            for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if d not in _FUZZY_FALLBACK_EXCLUDES and not d.startswith(".")
+                ]
+                rel_dir = os.path.relpath(dirpath, root)
+                for f in filenames:
+                    rel = f if rel_dir == "." else f"{rel_dir}/{f}"
+                    files.append(rel.replace(os.sep, "/"))
+                    if len(files) >= _FUZZY_CACHE_MAX_FILES:
+                        break
+                if len(files) >= _FUZZY_CACHE_MAX_FILES:
+                    break
+        except OSError:
+            pass
+
+    with _fuzzy_cache_lock:
+        _fuzzy_cache[root] = (now, files)
+
+    return files
+
+
+def _fuzzy_basename_rank(name: str, query: str) -> tuple[int, int] | None:
+    """Rank ``name`` against ``query``; lower is better. Returns None to reject.
+
+    Tiers (kind):
+      0 — exact basename
+      1 — basename prefix (e.g. `app` → `appChrome.tsx`)
+      2 — word-boundary / camelCase hit (e.g. `chrome` → `appChrome.tsx`)
+      3 — substring anywhere in basename
+      4 — subsequence match (every query char appears in order)
+
+    Secondary key is `len(name)` so shorter names win ties.
+    """
+    if not query:
+        return (3, len(name))
+
+    nl = name.lower()
+    ql = query.lower()
+
+    if nl == ql:
+        return (0, len(name))
+
+    if nl.startswith(ql):
+        return (1, len(name))
+
+    # Word-boundary split: `foo-bar_baz.qux` → ["foo","bar","baz","qux"].
+    # camelCase split: `appChrome` → ["app","Chrome"]. Cheap approximation;
+    # falls through to substring/subsequence if it misses.
+    parts: list[str] = []
+    buf = ""
+    for ch in name:
+        if ch in "-_." or (ch.isupper() and buf and not buf[-1].isupper()):
+            if buf:
+                parts.append(buf)
+            buf = ch if ch not in "-_." else ""
+        else:
+            buf += ch
+    if buf:
+        parts.append(buf)
+    for p in parts:
+        if p.lower().startswith(ql):
+            return (2, len(name))
+
+    if ql in nl:
+        return (3, len(name))
+
+    i = 0
+    for ch in nl:
+        if ch == ql[i]:
+            i += 1
+            if i == len(ql):
+                return (4, len(name))
+
+    return None
+
 
 @method("complete.path")
 def _(rid, params: dict) -> dict:
@@ -3116,6 +3446,42 @@ def _(rid, params: dict) -> dict:
         else:
             prefix_tag = ""
             path_part = query if is_context else query
+
+        # Fuzzy basename search across the repo when the user types a bare
+        # name with no path separator — `@appChrome` surfaces every file
+        # whose basename matches, regardless of directory depth. Matches what
+        # editors like Cursor / VS Code do for Cmd-P. Path-ish queries (with
+        # `/`, `./`, `~/`, `/abs`) fall through to the directory-listing
+        # path so explicit navigation intent is preserved.
+        if (
+            is_context
+            and path_part
+            and "/" not in path_part
+            and prefix_tag != "folder"
+        ):
+            root = os.getcwd()
+            ranked: list[tuple[tuple[int, int], str, str]] = []
+            for rel in _list_repo_files(root):
+                basename = os.path.basename(rel)
+                if basename.startswith(".") and not path_part.startswith("."):
+                    continue
+                rank = _fuzzy_basename_rank(basename, path_part)
+                if rank is None:
+                    continue
+                ranked.append((rank, rel, basename))
+
+            ranked.sort(key=lambda r: (r[0], len(r[1]), r[1]))
+            tag = prefix_tag or "file"
+            for _, rel, basename in ranked[:30]:
+                items.append(
+                    {
+                        "text": f"@{tag}:{rel}",
+                        "display": basename,
+                        "meta": os.path.dirname(rel),
+                    }
+                )
+
+            return _ok(rid, {"items": items})
 
         expanded = _normalize_completion_path(path_part) if path_part else "."
         if expanded == "." or not expanded:
@@ -3386,43 +3752,155 @@ def _(rid, params: dict) -> dict:
 # ── Methods: voice ───────────────────────────────────────────────────
 
 
+_voice_sid_lock = threading.Lock()
+_voice_event_sid: str = ""
+
+
+def _voice_emit(event: str, payload: dict | None = None) -> None:
+    """Emit a voice event toward the session that most recently turned the
+    mode on. Voice is process-global (one microphone), so there's only ever
+    one sid to target; the TUI handler treats an empty sid as "active
+    session". Kept separate from _emit to make the lack of per-call sid
+    argument explicit."""
+    with _voice_sid_lock:
+        sid = _voice_event_sid
+    _emit(event, sid, payload)
+
+
+def _voice_mode_enabled() -> bool:
+    """Current voice-mode flag (runtime-only, CLI parity).
+
+    cli.py initialises ``_voice_mode = False`` at startup and only flips
+    it via ``/voice on``; it never reads a persisted enable bit from
+    config.yaml.  We match that: no config lookup, env var only.  This
+    avoids the TUI auto-starting in REC the next time the user opens it
+    just because they happened to enable voice in a prior session.
+    """
+    return os.environ.get("HERMES_VOICE", "").strip() == "1"
+
+
+def _voice_tts_enabled() -> bool:
+    """Whether agent replies should be spoken back via TTS (runtime only)."""
+    return os.environ.get("HERMES_VOICE_TTS", "").strip() == "1"
+
+
 @method("voice.toggle")
 def _(rid, params: dict) -> dict:
+    """CLI parity for the ``/voice`` slash command.
+
+    Subcommands:
+
+    * ``status`` — report mode + TTS flags (default when action is unknown).
+    * ``on`` / ``off`` — flip voice *mode* (the umbrella bit). Turning it
+      off also tears down any active continuous recording loop. Does NOT
+      start recording on its own; recording is driven by ``voice.record``
+      (Ctrl+B) after mode is on, matching cli.py's enable/Ctrl+B split.
+    * ``tts`` — toggle speech-output of agent replies. Requires mode on
+      (mirrors CLI's _toggle_voice_tts guard).
+    """
     action = params.get("action", "status")
+
     if action == "status":
-        env = os.environ.get("HERMES_VOICE", "").strip()
-        if env in {"0", "1"}:
-            return _ok(rid, {"enabled": env == "1"})
-        return _ok(
-            rid,
-            {
-                "enabled": bool(
-                    _load_cfg().get("display", {}).get("voice_enabled", False)
-                )
-            },
-        )
+        # Mirror CLI's _show_voice_status: include STT/TTS provider
+        # availability so the user can tell at a glance *why* voice mode
+        # isn't working ("STT provider: MISSING ..." is the common case).
+        payload: dict = {
+            "enabled": _voice_mode_enabled(),
+            "tts": _voice_tts_enabled(),
+        }
+        try:
+            from tools.voice_mode import check_voice_requirements
+
+            reqs = check_voice_requirements()
+            payload["available"] = bool(reqs.get("available"))
+            payload["audio_available"] = bool(reqs.get("audio_available"))
+            payload["stt_available"] = bool(reqs.get("stt_available"))
+            payload["details"] = reqs.get("details") or ""
+        except Exception as e:
+            # check_voice_requirements pulls optional transcription deps —
+            # swallow so /voice status always returns something useful.
+            logger.warning("voice.toggle status: requirements probe failed: %s", e)
+
+        return _ok(rid, payload)
+
     if action in ("on", "off"):
         enabled = action == "on"
+        # Runtime-only flag (CLI parity) — no _write_config_key, so the
+        # next TUI launch starts with voice OFF instead of auto-REC from a
+        # persisted stale toggle.
         os.environ["HERMES_VOICE"] = "1" if enabled else "0"
-        _write_config_key("display.voice_enabled", enabled)
-        return _ok(rid, {"enabled": action == "on"})
+
+        if not enabled:
+            # Disabling the mode must tear the continuous loop down; the
+            # loop holds the microphone and would otherwise keep running.
+            try:
+                from hermes_cli.voice import stop_continuous
+
+                stop_continuous()
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.warning("voice: stop_continuous failed during toggle off: %s", e)
+
+        return _ok(rid, {"enabled": enabled, "tts": _voice_tts_enabled()})
+
+    if action == "tts":
+        if not _voice_mode_enabled():
+            return _err(rid, 4014, "enable voice mode first: /voice on")
+        new_value = not _voice_tts_enabled()
+        # Runtime-only flag (CLI parity) — see voice.toggle on/off above.
+        os.environ["HERMES_VOICE_TTS"] = "1" if new_value else "0"
+        return _ok(rid, {"enabled": True, "tts": new_value})
+
     return _err(rid, 4013, f"unknown voice action: {action}")
 
 
 @method("voice.record")
 def _(rid, params: dict) -> dict:
+    """VAD-driven continuous record loop, CLI-parity.
+
+    ``start`` turns on a VAD loop that emits ``voice.transcript`` events
+    for each detected utterance and auto-restarts for the next turn.
+    ``stop`` halts the loop (manual stop; matches cli.py's Ctrl+B-while-
+    recording branch clearing ``_voice_continuous``). Three consecutive
+    silent cycles stop the loop automatically and emit a
+    ``voice.transcript`` with ``no_speech_limit=True``.
+    """
     action = params.get("action", "start")
+
+    if action not in {"start", "stop"}:
+        return _err(rid, 4019, f"unknown voice action: {action}")
+
     try:
         if action == "start":
-            from hermes_cli.voice import start_recording
+            if not _voice_mode_enabled():
+                return _err(rid, 4015, "voice mode is off — enable with /voice on")
 
-            start_recording()
+            with _voice_sid_lock:
+                global _voice_event_sid
+                _voice_event_sid = params.get("session_id") or _voice_event_sid
+
+            from hermes_cli.voice import start_continuous
+
+            voice_cfg = _load_cfg().get("voice", {})
+            start_continuous(
+                on_transcript=lambda t: _voice_emit(
+                    "voice.transcript", {"text": t}
+                ),
+                on_status=lambda s: _voice_emit("voice.status", {"state": s}),
+                on_silent_limit=lambda: _voice_emit(
+                    "voice.transcript", {"no_speech_limit": True}
+                ),
+                silence_threshold=voice_cfg.get("silence_threshold", 200),
+                silence_duration=voice_cfg.get("silence_duration", 3.0),
+            )
             return _ok(rid, {"status": "recording"})
-        if action == "stop":
-            from hermes_cli.voice import stop_and_transcribe
 
-            return _ok(rid, {"text": stop_and_transcribe() or ""})
-        return _err(rid, 4019, f"unknown voice action: {action}")
+        # action == "stop"
+        from hermes_cli.voice import stop_continuous
+
+        stop_continuous()
+        return _ok(rid, {"status": "stopped"})
     except ImportError:
         return _err(
             rid, 5025, "voice module not available — install audio dependencies"
@@ -3453,11 +3931,14 @@ def _(rid, params: dict) -> dict:
 @method("insights.get")
 def _(rid, params: dict) -> dict:
     days = params.get("days", 30)
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5017)
     try:
         cutoff = time.time() - days * 86400
         rows = [
             s
-            for s in _get_db().list_sessions_rich(limit=500)
+            for s in db.list_sessions_rich(limit=500)
             if (s.get("started_at") or 0) >= cutoff
         ]
         return _ok(

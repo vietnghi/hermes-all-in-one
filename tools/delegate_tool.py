@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
 from tools import file_state
-from utils import base_url_hostname
+from utils import base_url_hostname, is_truthy_value
 
 
 # Tools that children must never have access to
@@ -298,7 +298,7 @@ def _get_child_timeout() -> float:
     """Read delegation.child_timeout_seconds from config.
 
     Returns the number of seconds a single child agent is allowed to run
-    before being considered stuck.  Default: 300 s (5 minutes).
+    before being considered stuck.  Default: 600 s (10 minutes).
     """
     cfg = _load_config()
     val = cfg.get("child_timeout_seconds")
@@ -376,8 +376,40 @@ def _get_orchestrator_enabled() -> bool:
     return True
 
 
+def _get_inherit_mcp_toolsets() -> bool:
+    """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
+    cfg = _load_config()
+    return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
+
+
+def _is_mcp_toolset_name(name: str) -> bool:
+    """Return True for canonical MCP toolsets and their registered aliases."""
+    if not name:
+        return False
+    if str(name).startswith("mcp-"):
+        return True
+    try:
+        from tools.registry import registry
+
+        target = registry.get_toolset_alias_target(str(name))
+    except Exception:
+        target = None
+    return bool(target and str(target).startswith("mcp-"))
+
+
+def _preserve_parent_mcp_toolsets(
+    child_toolsets: List[str], parent_toolsets: set[str]
+) -> List[str]:
+    """Append any parent MCP toolsets that are missing from a narrowed child."""
+    preserved = list(child_toolsets)
+    for toolset_name in sorted(parent_toolsets):
+        if _is_mcp_toolset_name(toolset_name) and toolset_name not in preserved:
+            preserved.append(toolset_name)
+    return preserved
+
+
 DEFAULT_MAX_ITERATIONS = 50
-DEFAULT_CHILD_TIMEOUT = 300  # seconds before a child agent is considered stuck
+DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 _HEARTBEAT_STALE_CYCLES = (
     5  # mark child stale after this many heartbeats with no iteration progress
@@ -782,6 +814,8 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
+    delegation_cfg = _load_config()
+
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
@@ -803,9 +837,12 @@ def _build_child_agent(
 
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks
-        child_toolsets = _strip_blocked_tools(
-            [t for t in toolsets if t in parent_toolsets]
-        )
+        child_toolsets = [t for t in toolsets if t in parent_toolsets]
+        if _get_inherit_mcp_toolsets():
+            child_toolsets = _preserve_parent_mcp_toolsets(
+                child_toolsets, parent_toolsets
+            )
+        child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
         child_toolsets = _strip_blocked_tools(parent_enabled)
     elif parent_toolsets:
@@ -885,11 +922,16 @@ def _build_child_agent(
         else (getattr(parent_agent, "acp_args", []) or [])
     )
 
+    if override_acp_command:
+        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
+        # so run_agent.py initializes the CopilotACPClient.
+        effective_provider = "copilot-acp"
+        effective_api_mode = "chat_completions"
+
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
-        delegation_cfg = _load_config()
         delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
         if delegation_effort:
             from hermes_constants import parse_reasoning_effort
@@ -1516,7 +1558,18 @@ def delegate_task(
     # Load config
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
-    effective_max_iter = max_iterations or default_max_iter
+    # Model-supplied max_iterations is ignored — the config value is authoritative
+    # so users get predictable budgets. The kwarg is retained for internal callers
+    # and tests; a model-emitted value here would only shrink the budget and
+    # surprise the user mid-run. Log and drop it if one slips through from a
+    # cached tool schema or a stale provider.
+    if max_iterations is not None and max_iterations != default_max_iter:
+        logger.debug(
+            "delegate_task: ignoring caller-supplied max_iterations=%s; "
+            "using delegation.max_iterations=%s from config",
+            max_iterations, default_max_iter,
+        )
+    effective_max_iter = default_max_iter
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -2054,13 +2107,6 @@ DELEGATE_TASK_SCHEMA = {
                     "Batch mode: tasks to run in parallel (limit configurable via delegation.max_concurrent_children, default 3). Each gets "
                     "its own subagent with isolated context and terminal session. "
                     "When provided, top-level goal/context/toolsets are ignored."
-                ),
-            },
-            "max_iterations": {
-                "type": "integer",
-                "description": (
-                    "Max tool-calling turns per subagent (default: 50). "
-                    "Only set lower for simple tasks."
                 ),
             },
             "role": {
