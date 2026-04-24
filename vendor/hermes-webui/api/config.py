@@ -459,6 +459,8 @@ CLI_TOOLSETS = _resolve_cli_toolsets()
 # Also used as the OpenRouter model list — keep this curated to current, widely-used models.
 _FALLBACK_MODELS = [
     # OpenAI
+    {"provider": "OpenAI", "id": "openai/gpt-5.4-nano", "label": "GPT 5.4 Nano"},
+    {"provider": "OpenAI", "id": "openai/gpt-5.4-pro", "label": "GPT 5.4 Pro"},
     {"provider": "OpenAI",    "id": "openai/gpt-5.1-codex-mini",              "label": "GPT-5.1 Codex Mini"},
     {"provider": "OpenAI",    "id": "openai/gpt-5.1-codex-max",               "label": "GPT-5.1 Codex Max"},
     {"provider": "OpenAI",    "id": "openai/gpt-5.2-codex",                   "label": "GPT-5.2 Codex"},
@@ -469,11 +471,15 @@ _FALLBACK_MODELS = [
     {"provider": "OpenAI",    "id": "openai/gpt-5.4-mini",                "label": "GPT-5.4 Mini"},
     {"provider": "OpenAI",    "id": "openai/gpt-5.4",                     "label": "GPT-5.4"},
     # Anthropic — 4.6 flagship + 4.5 generation
+    {"provider": "Anthropic", "id": "anthropic/claude-haiku-4.5", "label": "Claude Haiku 4.5"},
+    {"provider": "Anthropic", "id": "anthropic/claude-sonnet-4.5", "label": "Claude Sonnet 4.5"},
+    {"provider": "Anthropic", "id": "anthropic/claude-opus-4.7", "label": "Claude Opus 4.7"},
     {"provider": "Anthropic", "id": "anthropic/claude-opus-4.6",          "label": "Claude Opus 4.6"},
     {"provider": "Anthropic", "id": "anthropic/claude-sonnet-4.6",        "label": "Claude Sonnet 4.6"},
     {"provider": "Anthropic", "id": "anthropic/claude-sonnet-4-5",        "label": "Claude Sonnet 4.5"},
     {"provider": "Anthropic", "id": "anthropic/claude-haiku-4-5",         "label": "Claude Haiku 4.5"},
     # Google — 3.x (latest preview) + 2.5 (stable GA)
+    {"provider": "Google", "id": "google/gemini-3-pro-image-preview", "label": "Gemini 3 Pro Image Preview"},
     {"provider": "Google",    "id": "google/gemini-3.1-pro-preview",            "label": "Gemini 3.1 Pro Preview"},
     {"provider": "Google",    "id": "google/gemini-3-flash-preview",            "label": "Gemini 3 Flash Preview"},
     {"provider": "Google",    "id": "google/gemini-3.1-flash-lite-preview",     "label": "Gemini 3.1 Flash Lite Preview"},
@@ -483,6 +489,8 @@ _FALLBACK_MODELS = [
     {"provider": "DeepSeek",  "id": "deepseek/deepseek-chat-v3-0324",     "label": "DeepSeek V3"},
     {"provider": "DeepSeek",  "id": "deepseek/deepseek-r1",               "label": "DeepSeek R1"},
     # Qwen (Alibaba) — strong coding and general models
+    {"provider": "Qwen", "id": "qwen/qwen3.5-35b-a3b", "label": "Qwen3.5 35b A3b"},
+    {"provider": "Qwen", "id": "qwen/qwen3.5-plus-02-15", "label": "Qwen3.5 Plus 02 15"},
     {"provider": "Qwen",      "id": "qwen/qwen3-coder",                   "label": "Qwen3 Coder"},
     {"provider": "Qwen",      "id": "qwen/qwen3.6-plus",                  "label": "Qwen3.6 Plus"},
     # xAI
@@ -490,6 +498,8 @@ _FALLBACK_MODELS = [
     # Mistral
     {"provider": "Mistral",   "id": "mistralai/mistral-large-latest",     "label": "Mistral Large"},
     # MiniMax
+    {"provider": "MiniMax", "id": "minimax/minimax-m2.5", "label": "Minimax M2.5"},
+    {"provider": "MiniMax", "id": "minimax/minimax-m2.7", "label": "Minimax M2.7"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7",             "label": "MiniMax M2.7"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7-highspeed",   "label": "MiniMax M2.7 Highspeed"},
 ]
