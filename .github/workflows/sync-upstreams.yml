@@ -1,0 +1,51 @@
+name: Sync Upstreams
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # daily at 3am UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstreams
+        run: |
+          git remote add hermes-agent-upstream https://github.com/NousResearch/hermes-agent.git || true
+          git remote add hermes-webui-upstream https://github.com/sphinxcode/hermes-webui.git || true
+
+      - name: Fetch upstreams
+        run: |
+          git fetch hermes-agent-upstream main
+          git fetch hermes-webui-upstream master
+
+      - name: Sync hermes-agent
+        run: |
+          git subtree pull --prefix=vendor/hermes-agent hermes-agent-upstream main --squash \
+            -m "chore(sync): update vendor/hermes-agent from upstream" || true
+
+      - name: Sync hermes-webui
+        run: |
+          git subtree pull --prefix=vendor/hermes-webui hermes-webui-upstream master --squash \
+            -m "chore(sync): update vendor/hermes-webui from upstream" || true
+
+      - name: Push if changed
+        run: |
+          if git diff --quiet HEAD@{1} HEAD 2>/dev/null; then
+            echo "Nothing changed, skipping push."
+          else
+            git push origin main
+          fi
