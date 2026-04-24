@@ -56,6 +56,12 @@ run git subtree pull --prefix="$AGENT_PREFIX" "$AGENT_REMOTE_NAME" "$AGENT_REMOT
 run git subtree pull --prefix="$WEBUI_PREFIX" "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF" --squash
 
 echo
+echo "[sync] patching vendor model lists from hermes-agent..."
+python3 "${ROOT_DIR}/scripts/patch-vendor-models.py"
+if ! git diff --quiet vendor/hermes-webui/api/config.py; then
+  git add vendor/hermes-webui/api/config.py
+  git commit -m "chore(sync): patch webui model list from hermes-agent"
+fi
 
 echo "[sync] upstream refresh complete"
 echo "[sync] next steps:"

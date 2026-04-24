@@ -459,6 +459,13 @@ CLI_TOOLSETS = _resolve_cli_toolsets()
 # Also used as the OpenRouter model list — keep this curated to current, widely-used models.
 _FALLBACK_MODELS = [
     # OpenAI
+    {"provider": "OpenAI",    "id": "openai/gpt-5.1-codex-mini",              "label": "GPT-5.1 Codex Mini"},
+    {"provider": "OpenAI",    "id": "openai/gpt-5.1-codex-max",               "label": "GPT-5.1 Codex Max"},
+    {"provider": "OpenAI",    "id": "openai/gpt-5.2-codex",                   "label": "GPT-5.2 Codex"},
+    {"provider": "OpenAI",    "id": "openai/gpt-5.3-codex",                   "label": "GPT-5.3 Codex"},
+    {"provider": "OpenAI",    "id": "openai/gpt-5.4",                         "label": "GPT-5.4"},
+    {"provider": "OpenAI",    "id": "openai/gpt-5.4-mini",                    "label": "GPT-5.4 Mini"},
+    {"provider": "OpenAI",    "id": "openai/gpt-5.5",                         "label": "GPT-5.5"},
     {"provider": "OpenAI",    "id": "openai/gpt-5.4-mini",                "label": "GPT-5.4 Mini"},
     {"provider": "OpenAI",    "id": "openai/gpt-5.4",                     "label": "GPT-5.4"},
     # Anthropic — 4.6 flagship + 4.5 generation
@@ -588,10 +595,16 @@ _PROVIDER_MODELS = {
         {"id": "claude-haiku-4-5", "label": "Claude Haiku 4.5"},
     ],
     "openai": [
+        {"id": "gpt-5.1-codex-mini", "label": "GPT-5.1 Codex Mini"},
+        {"id": "gpt-5.1-codex-max", "label": "GPT-5.1 Codex Max"},
+        {"id": "gpt-5.2-codex", "label": "GPT-5.2 Codex"},
+        {"id": "gpt-5.3-codex", "label": "GPT-5.3 Codex"},
+        {"id": "gpt-5.5", "label": "GPT-5.5"},
         {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
         {"id": "gpt-5.4",      "label": "GPT-5.4"},
     ],
     "openai-codex": [
+        {"id": "gpt-5.5", "label": "GPT-5.5"},
         {"id": "gpt-5.4", "label": "GPT-5.4"},
         {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
         {"id": "gpt-5.3-codex", "label": "GPT-5.3 Codex"},
