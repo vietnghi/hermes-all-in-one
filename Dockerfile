@@ -1,7 +1,7 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl nodejs npm \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl git nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
