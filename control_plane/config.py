@@ -326,8 +326,16 @@ def provider_catalog() -> list[dict[str, Any]]:
     ]
 
 
-PAIRING_DIR = HERMES_HOME / "pairing"
+_PAIRING_OLD = HERMES_HOME / "pairing"
+_PAIRING_NEW = HERMES_HOME / "platforms" / "pairing"
 CODE_TTL_SECONDS = 3600
+
+
+def _pairing_dir() -> Path:
+    """Resolve pairing directory — matches gateway's get_hermes_dir() logic."""
+    if _PAIRING_OLD.exists():
+        return _PAIRING_OLD
+    return _PAIRING_NEW
 
 
 def _load_pairing_json(path: Path) -> dict:
@@ -349,19 +357,21 @@ def _save_pairing_json(path: Path, data: dict) -> None:
 
 
 def pairing_platforms(suffix: str) -> list[str]:
-    if not PAIRING_DIR.exists():
+    d = _pairing_dir()
+    if not d.exists():
         return []
     return [
         f.stem.rsplit(f"-{suffix}", 1)[0]
-        for f in PAIRING_DIR.glob(f"*-{suffix}.json")
+        for f in d.glob(f"*-{suffix}.json")
     ]
 
 
 def get_pending_pairings() -> list[dict[str, Any]]:
     now = time.time()
     results: list[dict[str, Any]] = []
+    d = _pairing_dir()
     for platform in pairing_platforms("pending"):
-        pending = _load_pairing_json(PAIRING_DIR / f"{platform}-pending.json")
+        pending = _load_pairing_json(d / f"{platform}-pending.json")
         for code, info in pending.items():
             age = now - info.get("created_at", now)
             if age > CODE_TTL_SECONDS:
@@ -378,8 +388,9 @@ def get_pending_pairings() -> list[dict[str, Any]]:
 
 def get_approved_users() -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    d = _pairing_dir()
     for platform in pairing_platforms("approved"):
-        approved = _load_pairing_json(PAIRING_DIR / f"{platform}-approved.json")
+        approved = _load_pairing_json(d / f"{platform}-approved.json")
         for user_id, info in approved.items():
             results.append({
                 "platform": platform,
@@ -391,13 +402,14 @@ def get_approved_users() -> list[dict[str, Any]]:
 
 
 def approve_pairing(platform: str, code: str) -> dict[str, str]:
-    pending_path = PAIRING_DIR / f"{platform}-pending.json"
+    d = _pairing_dir()
+    pending_path = d / f"{platform}-pending.json"
     pending = _load_pairing_json(pending_path)
     if code not in pending:
         raise KeyError("Code not found or expired")
     entry = pending.pop(code)
     _save_pairing_json(pending_path, pending)
-    approved_path = PAIRING_DIR / f"{platform}-approved.json"
+    approved_path = d / f"{platform}-approved.json"
     approved = _load_pairing_json(approved_path)
     approved[entry["user_id"]] = {
         "user_name": entry.get("user_name", ""),
@@ -408,7 +420,7 @@ def approve_pairing(platform: str, code: str) -> dict[str, str]:
 
 
 def deny_pairing(platform: str, code: str) -> None:
-    pending_path = PAIRING_DIR / f"{platform}-pending.json"
+    pending_path = _pairing_dir() / f"{platform}-pending.json"
     pending = _load_pairing_json(pending_path)
     if code in pending:
         del pending[code]
@@ -416,7 +428,7 @@ def deny_pairing(platform: str, code: str) -> None:
 
 
 def revoke_user(platform: str, user_id: str) -> None:
-    approved_path = PAIRING_DIR / f"{platform}-approved.json"
+    approved_path = _pairing_dir() / f"{platform}-approved.json"
     approved = _load_pairing_json(approved_path)
     if user_id in approved:
         del approved[user_id]

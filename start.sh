@@ -19,6 +19,7 @@ mkdir -p \
   "${HERMES_HOME}/sessions" \
   "${HERMES_HOME}/skills" \
   "${HERMES_HOME}/optional-skills" \
+  "${HERMES_HOME}/pairing" \
   "${HERMES_WEBUI_STATE_DIR}" \
   "${HERMES_WORKSPACE_DIR}"
 
