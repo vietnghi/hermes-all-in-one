@@ -340,6 +340,128 @@ function startPolling() {
   refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 5000);
 }
 
+// ── Pairing / Users ──────────────────────────────────────────────────────────
+
+function formatDate(ts) {
+  if (!ts) return '—';
+  return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+async function loadPairing() {
+  try {
+    const [pendingRes, approvedRes] = await Promise.all([
+      fetch('/admin/api/pairing/pending', { headers: { Accept: 'application/json' } }),
+      fetch('/admin/api/pairing/approved', { headers: { Accept: 'application/json' } }),
+    ]);
+    if (pendingRes.ok) renderPending((await pendingRes.json()).pending || []);
+    if (approvedRes.ok) renderApproved((await approvedRes.json()).approved || []);
+  } catch (_) { /* non-fatal */ }
+}
+
+function renderPending(items) {
+  const empty = qs('#pending-empty');
+  const table = qs('#pending-table');
+  const tbody = qs('#pending-tbody');
+  const badge = qs('#pending-count');
+  if (!tbody) return;
+
+  if (badge) {
+    if (items.length > 0) {
+      badge.textContent = items.length;
+      badge.style.display = '';
+    } else {
+      badge.style.display = 'none';
+    }
+  }
+
+  if (items.length === 0) {
+    if (empty) empty.style.display = '';
+    if (table) table.style.display = 'none';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (table) table.style.display = '';
+
+  tbody.innerHTML = items.map(req => `
+    <tr>
+      <td class="platform">${esc(req.platform)}</td>
+      <td>${esc(req.user_name || '—')}</td>
+      <td class="mono">${esc(req.user_id)}</td>
+      <td>${req.age_minutes}m ago</td>
+      <td>
+        <div class="action-row">
+          <button class="btn-approve" onclick="approveUser('${esc(req.platform)}', '${esc(req.code)}')">Approve</button>
+          <button class="btn-deny" onclick="denyUser('${esc(req.platform)}', '${esc(req.code)}')">Deny</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function renderApproved(items) {
+  const empty = qs('#approved-empty');
+  const table = qs('#approved-table');
+  const tbody = qs('#approved-tbody');
+  if (!tbody) return;
+
+  if (items.length === 0) {
+    if (empty) empty.style.display = '';
+    if (table) table.style.display = 'none';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (table) table.style.display = '';
+
+  tbody.innerHTML = items.map(user => `
+    <tr>
+      <td class="platform">${esc(user.platform)}</td>
+      <td>${esc(user.user_name || '—')}</td>
+      <td class="mono">${esc(user.user_id)}</td>
+      <td>${formatDate(user.approved_at)}</td>
+      <td>
+        <div class="action-row">
+          <button class="btn-revoke" onclick="revokeUser('${esc(user.platform)}', '${esc(user.user_id)}')">Revoke</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function esc(str) {
+  const d = document.createElement('div');
+  d.textContent = str || '';
+  return d.innerHTML;
+}
+
+async function approveUser(platform, code) {
+  try {
+    await postJson('/admin/api/pairing/approve', { platform, code });
+    await loadPairing();
+  } catch (err) { alert(err.message); }
+}
+
+async function denyUser(platform, code) {
+  try {
+    await postJson('/admin/api/pairing/deny', { platform, code });
+    await loadPairing();
+  } catch (err) { alert(err.message); }
+}
+
+async function revokeUser(platform, userId) {
+  if (!confirm('Revoke access for this user?')) return;
+  try {
+    await postJson('/admin/api/pairing/revoke', { platform, user_id: userId });
+    await loadPairing();
+  } catch (err) { alert(err.message); }
+}
+
+function wirePairing() {
+  const refreshBtn = qs('#refresh-pairing');
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => loadPairing());
+  }
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 wireNavigation();
@@ -347,6 +469,9 @@ wireRuntimeControls();
 wireProviderSelect();
 wireProviderForm();
 wireChannelForms();
+wirePairing();
 renderStatus(initialStatus);
 loadChannelFormValues();
 startPolling();
+loadPairing();
+setInterval(() => loadPairing(), 5000);

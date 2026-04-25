@@ -20,6 +20,7 @@
           <button class="nav-link active" data-panel="overview">Overview</button>
           <button class="nav-link" data-panel="providers">Providers</button>
           <button class="nav-link" data-panel="channels">Channels</button>
+          <button class="nav-link" data-panel="users">Users <span class="pairing-badge" id="pending-count" style="display:none"></span></button>
           <button class="nav-link" data-panel="logs">Logs</button>
         </nav>
         <div class="sidebar-footer">
@@ -247,6 +248,57 @@
               <div class="inline-status" id="email-form-status" style="display:none"></div>
             </article>
 
+          </div>
+        </section>
+
+        <!-- USERS -->
+        <section class="panel" id="panel-users">
+          <div class="grid">
+            <article class="card">
+              <div class="card-header">
+                <div>
+                  <span class="eyebrow">Pending</span>
+                  <h3>Pairing requests</h3>
+                </div>
+                <button class="secondary-button small-button" id="refresh-pairing" type="button">Refresh</button>
+              </div>
+              <p class="muted">When an unauthorized user messages your bot, they receive a pairing code. Approve or deny them here.</p>
+              <div id="pending-list">
+                <p class="muted" id="pending-empty">No pending pairing requests.</p>
+                <table class="data-table" id="pending-table" style="display:none">
+                  <thead>
+                    <tr>
+                      <th>Platform</th>
+                      <th>Username</th>
+                      <th>User ID</th>
+                      <th>Age</th>
+                      <th class="col-actions">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="pending-tbody"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="card">
+              <span class="eyebrow">Approved</span>
+              <h3>Active users</h3>
+              <div id="approved-list">
+                <p class="muted" id="approved-empty">No approved users yet.</p>
+                <table class="data-table" id="approved-table" style="display:none">
+                  <thead>
+                    <tr>
+                      <th>Platform</th>
+                      <th>Username</th>
+                      <th>User ID</th>
+                      <th>Approved</th>
+                      <th class="col-actions">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="approved-tbody"></tbody>
+                </table>
+              </div>
+            </article>
           </div>
         </section>
 

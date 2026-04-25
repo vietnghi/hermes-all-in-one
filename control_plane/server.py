@@ -33,14 +33,19 @@ from control_plane.config import (
     WEBUI_STATE_DIR,
     WORKSPACE_DIR,
     apply_provider_setup,
+    approve_pairing,
     channel_form_values,
     channel_summary,
+    deny_pairing,
     ensure_runtime_dirs,
     extract_model_config,
+    get_approved_users,
+    get_pending_pairings,
     load_env_file,
     load_yaml_config,
     masked_env_snapshot,
     provider_catalog,
+    revoke_user,
     save_channel_values,
 )
 from control_plane.gateway_manager import GatewayManager
@@ -223,8 +228,11 @@ async def api_provider_setup(request: Request) -> Response:
         base_url=str(body.get("base_url") or ""),
     )
     _invalidate_status_cache()
-    if gateway_manager.should_autostart() and not gateway_manager.is_running():
-        gateway_manager.start()
+    if gateway_manager.should_autostart():
+        if gateway_manager.is_running():
+            gateway_manager.restart()
+        else:
+            gateway_manager.start()
     return JSONResponse({"ok": True, "result": result, "status": _current_status()})
 
 
@@ -244,8 +252,11 @@ async def api_channel_save(request: Request) -> Response:
     updates = {key: body.get(key) for key in CHANNEL_ENV_KEYS if key in body}
     env_values = save_channel_values(HERMES_ENV_PATH, updates)
     _invalidate_status_cache()
-    if gateway_manager.should_autostart() and not gateway_manager.is_running():
-        gateway_manager.start()
+    if gateway_manager.should_autostart():
+        if gateway_manager.is_running():
+            gateway_manager.restart()
+        else:
+            gateway_manager.start()
     return JSONResponse({"ok": True, "channels": channel_summary(env_values), "status": _current_status()})
 
 
@@ -261,6 +272,62 @@ async def api_webui_action(request: Request) -> Response:
         return JSONResponse({"error": "unknown action"}, status_code=400)
     _invalidate_status_cache()
     return JSONResponse({"ok": True, "status": webui_manager.status()})
+
+
+async def api_pairing_pending(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    return JSONResponse({"ok": True, "pending": get_pending_pairings()})
+
+
+async def api_pairing_approved(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    return JSONResponse({"ok": True, "approved": get_approved_users()})
+
+
+async def api_pairing_approve(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    body = await request.json()
+    platform = str(body.get("platform", "")).strip()
+    code = str(body.get("code", "")).upper().strip()
+    if not platform or not code:
+        return JSONResponse({"error": "platform and code required"}, status_code=400)
+    try:
+        result = approve_pairing(platform, code)
+    except KeyError:
+        return JSONResponse({"error": "Code not found or expired"}, status_code=404)
+    return JSONResponse({"ok": True, **result})
+
+
+async def api_pairing_deny(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    body = await request.json()
+    platform = str(body.get("platform", "")).strip()
+    code = str(body.get("code", "")).upper().strip()
+    if not platform or not code:
+        return JSONResponse({"error": "platform and code required"}, status_code=400)
+    deny_pairing(platform, code)
+    return JSONResponse({"ok": True})
+
+
+async def api_pairing_revoke(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    body = await request.json()
+    platform = str(body.get("platform", "")).strip()
+    user_id = str(body.get("user_id", "")).strip()
+    if not platform or not user_id:
+        return JSONResponse({"error": "platform and user_id required"}, status_code=400)
+    revoke_user(platform, user_id)
+    return JSONResponse({"ok": True})
 
 
 async def proxy_catchall(request: Request) -> Response:
@@ -280,6 +347,11 @@ routes = [
     Route("/admin/api/channels", api_channel_values, methods=["GET"]),
     Route("/admin/api/channels/save", api_channel_save, methods=["POST"]),
     Route("/admin/api/webui/{action}", api_webui_action, methods=["POST"]),
+    Route("/admin/api/pairing/pending", api_pairing_pending),
+    Route("/admin/api/pairing/approved", api_pairing_approved),
+    Route("/admin/api/pairing/approve", api_pairing_approve, methods=["POST"]),
+    Route("/admin/api/pairing/deny", api_pairing_deny, methods=["POST"]),
+    Route("/admin/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
     Mount("/admin/static", app=StaticFiles(directory=str(BASE_DIR / "static")), name="admin-static"),
     Route("/", proxy_catchall, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/{path:path}", proxy_catchall, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
