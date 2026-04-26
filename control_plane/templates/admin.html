@@ -149,6 +149,23 @@
 
         <!-- CHANNELS -->
         <section class="panel" id="panel-channels">
+
+          <article class="card" style="margin-bottom:18px">
+            <span class="eyebrow">Gateway access</span>
+            <h3>User authorization mode</h3>
+            <p class="muted">Controls who can message your bot. Per-channel allowlists (below) take priority. If no allowlists are set, users go through the pairing approval flow in the Users tab — unless you enable open access here.</p>
+            <form id="gateway-access-form" class="form-grid">
+              <label class="toggle-row">
+                <input type="checkbox" id="input-GATEWAY_ALLOW_ALL_USERS">
+                <span>Allow all users — skip allowlists and pairing (use with caution)</span>
+              </label>
+              <div class="form-actions">
+                <button class="primary-button" type="submit">Save access settings</button>
+              </div>
+            </form>
+            <div class="inline-status" id="gateway-access-form-status" style="display:none"></div>
+          </article>
+
           <div class="grid two-up">
 
             <article class="card">

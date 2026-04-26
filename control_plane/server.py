@@ -228,11 +228,10 @@ async def api_provider_setup(request: Request) -> Response:
         base_url=str(body.get("base_url") or ""),
     )
     _invalidate_status_cache()
-    if gateway_manager.should_autostart():
-        if gateway_manager.is_running():
-            gateway_manager.restart()
-        else:
-            gateway_manager.start()
+    if gateway_manager.is_running():
+        gateway_manager.restart()
+    elif gateway_manager.should_autostart():
+        gateway_manager.start()
     return JSONResponse({"ok": True, "result": result, "status": _current_status()})
 
 
@@ -249,15 +248,18 @@ async def api_channel_save(request: Request) -> Response:
     if unauthorized:
         return unauthorized
     body = await request.json()
-    updates = {key: body.get(key) for key in CHANNEL_ENV_KEYS if key in body}
+    all_keys = set(CHANNEL_ENV_KEYS) | {"GATEWAY_ALLOW_ALL_USERS"}
+    updates = {key: body.get(key) for key in all_keys if key in body}
     env_values = save_channel_values(HERMES_ENV_PATH, updates)
     _invalidate_status_cache()
-    if gateway_manager.should_autostart():
-        if gateway_manager.is_running():
-            gateway_manager.restart()
-        else:
-            gateway_manager.start()
-    return JSONResponse({"ok": True, "channels": channel_summary(env_values), "status": _current_status()})
+    restarted = False
+    if gateway_manager.is_running():
+        gateway_manager.restart()
+        restarted = True
+    elif gateway_manager.should_autostart():
+        gateway_manager.start()
+        restarted = True
+    return JSONResponse({"ok": True, "restarted": restarted, "channels": channel_summary(env_values), "status": _current_status()})
 
 
 async def api_webui_action(request: Request) -> Response:

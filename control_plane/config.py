@@ -256,7 +256,8 @@ def should_autostart_gateway(
 
 
 def save_channel_values(env_path: Path, updates: dict[str, str | None]) -> dict[str, str]:
-    filtered = {key: value for key, value in updates.items() if key in CHANNEL_ENV_KEYS}
+    allowed = set(CHANNEL_ENV_KEYS) | GATEWAY_EXTRA_KEYS
+    filtered = {key: value for key, value in updates.items() if key in allowed}
     write_env_updates(env_path, filtered)
     return load_env_file(env_path)
 
@@ -271,14 +272,16 @@ def masked_env_snapshot(env_values: dict[str, str]) -> dict[str, str]:
     return masked
 
 
-_PLAINTEXT_CHANNEL_KEYS = {"TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS"}
+GATEWAY_EXTRA_KEYS = {"GATEWAY_ALLOW_ALL_USERS"}
+
+_PLAINTEXT_CHANNEL_KEYS = {"TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS"}
 
 
 def channel_form_values(env_values: dict[str, str]) -> dict[str, str]:
     """Return channel env values safe to pre-populate form fields.
     Tokens/passwords are masked; user ID lists are returned plaintext."""
     result: dict[str, str] = {}
-    for key in CHANNEL_ENV_KEYS:
+    for key in (*CHANNEL_ENV_KEYS, *GATEWAY_EXTRA_KEYS):
         value = env_values.get(key, "")
         if not value:
             result[key] = ""

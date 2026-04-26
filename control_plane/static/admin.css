@@ -156,6 +156,13 @@ input, select {
 }
 .btn-deny:hover, .btn-revoke:hover { background: rgba(239,68,68,.22); }
 .action-row { display: flex; gap: 8px; justify-content: flex-end; }
+.toggle-row {
+  display: flex; align-items: center; gap: 12px; flex-direction: row; cursor: pointer;
+}
+.toggle-row input[type="checkbox"] {
+  width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; flex-shrink: 0;
+}
+.toggle-row span { color: var(--text); font-size: 14px; }
 .pairing-badge {
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px;

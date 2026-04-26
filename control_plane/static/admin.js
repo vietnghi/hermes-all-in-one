@@ -146,14 +146,14 @@ async function loadChannelFormValues() {
     for (const [key, value] of Object.entries(values)) {
       const input = qs(`#input-${key}`);
       if (!input) continue;
-      if (input.type === 'password') {
-        // Show hint that a value is saved; don't put masked value in password field
+      if (input.type === 'checkbox') {
+        input.checked = (value || '').toLowerCase() === 'true';
+      } else if (input.type === 'password') {
         const hint = qs(`#hint-${key}`);
         if (hint && !hint.dataset.static) {
           hint.textContent = value ? `Saved (${value})` : '';
         }
       } else {
-        // Plaintext fields like TELEGRAM_ALLOWED_USERS — safe to show directly
         input.value = value || '';
       }
     }
@@ -253,8 +253,8 @@ function wireChannelForms() {
 
       try {
         const payload = await postJson('/admin/api/channels/save', data);
-        showStatus(statusEl, 'Saved.', 'success');
-        // Reload form values to reflect saved state
+        const msg = payload.restarted ? 'Saved — gateway restarting.' : 'Saved.';
+        showStatus(statusEl, msg, 'success');
         await loadChannelFormValues();
         await refreshStatus();
       } catch (err) {
@@ -263,6 +263,33 @@ function wireChannelForms() {
         if (btn) { btn.disabled = false; btn.textContent = origText; }
       }
     });
+  });
+}
+
+// ── Gateway access form ──────────────────────────────────────────────────────
+
+function wireGatewayAccessForm() {
+  const form = qs('#gateway-access-form');
+  const statusEl = qs('#gateway-access-form-status');
+  const checkbox = qs('#input-GATEWAY_ALLOW_ALL_USERS');
+  if (!form || !checkbox) return;
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const data = { GATEWAY_ALLOW_ALL_USERS: checkbox.checked ? 'true' : 'false' };
+    const btn = form.querySelector('[type="submit"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+    showStatus(statusEl, 'Saving…', 'info');
+    try {
+      const payload = await postJson('/admin/api/channels/save', data);
+      const msg = payload.restarted ? 'Saved — gateway restarting.' : 'Saved.';
+      showStatus(statusEl, msg, 'success');
+      await refreshStatus();
+    } catch (err) {
+      showStatus(statusEl, err.message, 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Save access settings'; }
+    }
   });
 }
 
@@ -469,6 +496,7 @@ wireRuntimeControls();
 wireProviderSelect();
 wireProviderForm();
 wireChannelForms();
+wireGatewayAccessForm();
 wirePairing();
 renderStatus(initialStatus);
 loadChannelFormValues();
