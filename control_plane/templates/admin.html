@@ -171,23 +171,13 @@
             <article class="card">
               <span class="eyebrow">Telegram</span>
               <h3>Bot connection</h3>
-              <p class="muted">Your Hermes agent's Telegram identity. The bot token connects the gateway; allowed user IDs control who can chat.</p>
+              <p class="muted">Paste your bot token from <strong>@BotFather</strong>. Users are managed via the pairing flow in the Users tab.</p>
               <form id="telegram-form" class="form-grid" data-channel="telegram">
                 <label>
                   <span>Bot token</span>
                   <input type="password" name="TELEGRAM_BOT_TOKEN" id="input-TELEGRAM_BOT_TOKEN"
                     placeholder="123456:ABCdef… — leave blank to keep current">
                   <small class="field-hint" id="hint-TELEGRAM_BOT_TOKEN"></small>
-                </label>
-                <label>
-                  <span>Allowed user IDs</span>
-                  <input type="text" name="TELEGRAM_ALLOWED_USERS" id="input-TELEGRAM_ALLOWED_USERS"
-                    placeholder="e.g. 123456789,987654321">
-                  <small class="field-hint">
-                    <strong>Required for instant access.</strong> Comma-separated numeric Telegram user IDs.
-                    If left empty, all users (including you) must go through the pairing code flow in the Users tab.
-                    Don't know your ID? Message <strong>@userinfobot</strong> on Telegram.
-                  </small>
                 </label>
                 <div class="form-actions">
                   <button class="primary-button" type="submit">Save Telegram</button>
@@ -199,19 +189,13 @@
             <article class="card">
               <span class="eyebrow">Discord</span>
               <h3>Bot connection</h3>
-              <p class="muted">Connect your Hermes agent to a Discord server.</p>
+              <p class="muted">Connect your Hermes agent to a Discord server. Users are managed via pairing.</p>
               <form id="discord-form" class="form-grid" data-channel="discord">
                 <label>
                   <span>Bot token</span>
                   <input type="password" name="DISCORD_BOT_TOKEN" id="input-DISCORD_BOT_TOKEN"
                     placeholder="Leave blank to keep current">
                   <small class="field-hint" id="hint-DISCORD_BOT_TOKEN"></small>
-                </label>
-                <label>
-                  <span>Allowed user IDs</span>
-                  <input type="text" name="DISCORD_ALLOWED_USERS" id="input-DISCORD_ALLOWED_USERS"
-                    placeholder="Optional — comma-separated Discord user IDs">
-                  <small class="field-hint" id="hint-DISCORD_ALLOWED_USERS"></small>
                 </label>
                 <div class="form-actions">
                   <button class="primary-button" type="submit">Save Discord</button>

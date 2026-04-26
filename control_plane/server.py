@@ -250,6 +250,10 @@ async def api_channel_save(request: Request) -> Response:
     body = await request.json()
     all_keys = set(CHANNEL_ENV_KEYS) | {"GATEWAY_ALLOW_ALL_USERS"}
     updates = {key: body.get(key) for key in all_keys if key in body}
+    if "TELEGRAM_BOT_TOKEN" in updates:
+        updates.setdefault("TELEGRAM_ALLOWED_USERS", None)
+    if "DISCORD_BOT_TOKEN" in updates:
+        updates.setdefault("DISCORD_ALLOWED_USERS", None)
     env_values = save_channel_values(HERMES_ENV_PATH, updates)
     _invalidate_status_cache()
     restarted = False
