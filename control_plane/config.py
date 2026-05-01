@@ -51,6 +51,13 @@ _SUPPORTED_PROVIDER_SETUPS: dict[str, dict[str, Any]] = {
         "default_base_url": "https://api.openai.com/v1",
         "requires_base_url": False,
     },
+    "opencode-go": {
+        "label": "OpenCode Go",
+        "env_var": "OPENCODE_GO_API_KEY",
+        "default_model": "deepseek-v4-flash",
+        "default_base_url": "https://opencode.ai/zen/go/v1",
+        "requires_base_url": False,
+    },
     "custom": {
         "label": "Custom OpenAI-compatible",
         "env_var": "OPENAI_API_KEY",
