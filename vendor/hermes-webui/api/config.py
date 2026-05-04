@@ -459,6 +459,7 @@ CLI_TOOLSETS = _resolve_cli_toolsets()
 # Also used as the OpenRouter model list — keep this curated to current, widely-used models.
 _FALLBACK_MODELS = [
     # OpenAI
+    {"provider": "OpenAI", "id": "openai/gpt-5.5-pro", "label": "GPT 5.5 Pro"},
     {"provider": "OpenAI", "id": "openai/gpt-5.4-nano", "label": "GPT 5.4 Nano"},
     {"provider": "OpenAI", "id": "openai/gpt-5.4-pro", "label": "GPT 5.4 Pro"},
     {"provider": "OpenAI",    "id": "openai/gpt-5.1-codex-mini",              "label": "GPT-5.1 Codex Mini"},
