@@ -6,12 +6,12 @@ cd "${ROOT_DIR}"
 
 AGENT_REMOTE_NAME="hermes-agent-upstream"
 AGENT_REMOTE_URL="https://github.com/NousResearch/hermes-agent.git"
-AGENT_REMOTE_REF="main"
+AGENT_REMOTE_REF="v0.14.0"
 AGENT_PREFIX="vendor/hermes-agent"
 
 WEBUI_REMOTE_NAME="hermes-webui-upstream"
 WEBUI_REMOTE_URL="https://github.com/sphinxcode/hermes-webui.git"
-WEBUI_REMOTE_REF="master"
+WEBUI_REMOTE_REF="v0.51.89"
 WEBUI_PREFIX="vendor/hermes-webui"
 
 run() {
