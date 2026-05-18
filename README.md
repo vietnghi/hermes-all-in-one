@@ -592,6 +592,25 @@ The control plane is a thin Starlette wrapper — not a framework, not a product
 
 ---
 
+## Keeping hermes-agent Up to Date
+
+`vendor/hermes-agent` is tracked as a **git subtree** from [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) (main branch). A GitHub Actions workflow runs daily at 03:00 UTC and opens a pull request whenever upstream has new commits.
+
+To sync manually from your local machine:
+
+```bash
+./scripts/sync-upstreams.sh
+```
+
+The script will:
+1. Pull the latest `vendor/hermes-agent` from `NousResearch/hermes-agent@main`
+2. Pull the latest `vendor/hermes-webui` from `sphinxcode/hermes-webui@master`
+3. Run `scripts/patch-vendor-models.py` to keep the WebUI model list in sync with hermes-agent
+
+The Dockerfile and `start.sh` require no changes when the vendor is updated — they install directly from the vendored tree at build time.
+
+---
+
 ## Credits
 
 This repository is a Railway deployment wrapper. All agent and WebUI logic lives upstream:

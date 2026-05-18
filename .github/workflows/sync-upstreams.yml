@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync:
@@ -22,6 +23,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      - name: Record pre-sync HEAD
+        id: pre_sync
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Add remotes
         run: |
           git remote add hermes-agent-upstream https://github.com/NousResearch/hermes-agent.git || true
@@ -34,15 +39,48 @@ jobs:
 
       - name: Sync hermes-agent
         run: |
-          git subtree pull --prefix=vendor/hermes-agent hermes-agent-upstream main --squash -m "chore(sync): update vendor/hermes-agent from upstream" || true
+          git subtree pull --prefix=vendor/hermes-agent hermes-agent-upstream main --squash \
+            -m "chore(sync): update vendor/hermes-agent from upstream" || true
 
       - name: Sync hermes-webui
         run: |
-          git subtree pull --prefix=vendor/hermes-webui hermes-webui-upstream master --squash -m "chore(sync): update vendor/hermes-webui from upstream" || true
+          git subtree pull --prefix=vendor/hermes-webui hermes-webui-upstream master --squash \
+            -m "chore(sync): update vendor/hermes-webui from upstream" || true
 
-      - name: Push if changed
+      - name: Patch vendor model lists
+        run: |
+          python3 scripts/patch-vendor-models.py
+          if ! git diff --quiet vendor/hermes-webui/api/config.py; then
+            git add vendor/hermes-webui/api/config.py
+            git commit -m "chore(sync): patch webui model list from hermes-agent"
+          fi
+
+      - name: Check for changes
+        id: changed
+        run: |
+          if git diff --quiet "${{ steps.pre_sync.outputs.sha }}" HEAD; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create sync branch and open PR
+        if: steps.changed.outputs.has_changes == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git diff --quiet HEAD~1 HEAD 2>/dev/null && echo "Nothing to push." && exit 0
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/sphinxcode/hermes-all-in-one.git" main
+          BRANCH="chore/sync-upstreams-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
+          gh pr create \
+            --title "chore(sync): update vendor/hermes-agent and vendor/hermes-webui from upstream" \
+            --body "Automated upstream sync from NousResearch/hermes-agent (main) and sphinxcode/hermes-webui (master).
+
+Triggered by the daily sync workflow. Review vendor/ diffs before merging." \
+            --base main \
+            --head "$BRANCH" \
+            --label "dependencies" || true
+
+      - name: No changes detected
+        if: steps.changed.outputs.has_changes == 'false'
+        run: echo "Vendors are already up to date — nothing to do."
