@@ -1,5 +1,15 @@
 # Hermes Web UI -- Changelog
 
+## [v0.51.89] — 2026-05-14
+
+### Added / Fixed
+- Sprint 51 release: UI polish, stability improvements, and compatibility updates
+  for hermes-agent v0.14.0.
+- Improved model dropdown handling for new provider entries.
+- Session persistence and streaming reliability improvements.
+- Gateway watcher and SSE stability fixes.
+- Miscellaneous bug fixes and test coverage additions.
+
 ## [v0.50.147] — 2026-04-22
 
 ### Fixed
