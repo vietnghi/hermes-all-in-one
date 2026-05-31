@@ -85,6 +85,8 @@ def _load_openrouter_models() -> list[tuple[str, str]]:
     return pairs
 
 
+_MODEL_ID_RE = re.compile(r'^[\w][\w.\-]*$')
+
 def _load_codex_models() -> list[str]:
     src = AGENT_CODEX.read_text(encoding="utf-8")
     m = re.search(
@@ -94,7 +96,13 @@ def _load_codex_models() -> list[str]:
     if not m:
         print("[patch] Warning: could not parse DEFAULT_CODEX_MODELS — skipping codex sync")
         return []
-    return re.findall(r'"([^"]+)"', m.group(1))
+    # Strip comment lines, then extract only strings that look like model IDs
+    body = "\n".join(
+        line for line in m.group(1).splitlines()
+        if not re.match(r'\s*#', line)
+    )
+    candidates = re.findall(r'"([^"\n]+)"', body)
+    return [c for c in candidates if _MODEL_ID_RE.match(c)]
 
 
 def _patch_fallback_models(text: str, openrouter: list[tuple[str, str]]) -> str:
