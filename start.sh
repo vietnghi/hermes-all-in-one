@@ -13,17 +13,6 @@ export CONTROL_PLANE_INTERNAL_WEBUI_PORT="${CONTROL_PLANE_INTERNAL_WEBUI_PORT:-8
 export HERMES_GATEWAY_AUTOSTART="${HERMES_GATEWAY_AUTOSTART:-auto}"
 export PYTHONUNBUFFERED=1
 
-# Fix volume ownership if /data is mounted as root. Only chown the specific
-# directories we need to write to, not recursively. This avoids permission
-# errors on files that can't be chowned (e.g., in read-only layers).
-if [ -d /data ] && [ "$(stat -c %U /data)" = "root" ]; then
-  # Chown /data itself and the directories we'll create
-  chown hermes:hermes /data 2>/dev/null || true
-  # Create directories first, then chown them
-  mkdir -p /data/.hermes /data/webui /data/workspace 2>/dev/null || true
-  chown hermes:hermes /data/.hermes /data/webui /data/workspace 2>/dev/null || true
-fi
-
 mkdir -p \
   /data \
   "${HERMES_HOME}" \
