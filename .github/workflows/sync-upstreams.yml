@@ -30,7 +30,7 @@ jobs:
       - name: Add remotes
         run: |
           git remote add hermes-agent-upstream https://github.com/NousResearch/hermes-agent.git || true
-          git remote add hermes-webui-upstream https://github.com/sphinxcode/hermes-webui.git || true
+          git remote add hermes-webui-upstream https://github.com/nesquena/hermes-webui || true
 
       - name: Fetch upstreams
         run: |
@@ -74,9 +74,7 @@ jobs:
           git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
           gh pr create \
             --title "chore(sync): update vendor/hermes-agent and vendor/hermes-webui from upstream" \
-            --body "Automated upstream sync from NousResearch/hermes-agent (main) and sphinxcode/hermes-webui (master).
-
-Triggered by the daily sync workflow. Review vendor/ diffs before merging." \
+            --body "Automated upstream sync from NousResearch/hermes-agent and nesquena/hermes-webui. Review vendor/ diffs before merging." \
             --base main \
             --head "$BRANCH" \
             --label "dependencies" || true
