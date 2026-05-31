@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -54,6 +55,8 @@ from control_plane.webui_manager import WebUIManager
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+logger = logging.getLogger(__name__)
 
 webui_manager = WebUIManager()
 gateway_manager = GatewayManager()
@@ -117,6 +120,10 @@ async def on_shutdown() -> None:
 async def health(request: Request) -> JSONResponse:
     status = _current_status()
     webui_ok = bool(status["webui"]["healthy"])
+    logger.info("Health check — full status: %s", json.dumps(status, default=str))
+    logger.info("Health check — webui status: %s", status["webui"])
+    logger.info("Health check — gateway status: %s", status["gateway"])
+    logger.info("Health check — webui_ok: %s", webui_ok)
     payload = {
         "status": "ok" if webui_ok else "degraded",
         "service": "hermes-control-plane",
