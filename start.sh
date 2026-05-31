@@ -13,13 +13,6 @@ export CONTROL_PLANE_INTERNAL_WEBUI_PORT="${CONTROL_PLANE_INTERNAL_WEBUI_PORT:-8
 export HERMES_GATEWAY_AUTOSTART="${HERMES_GATEWAY_AUTOSTART:-auto}"
 export PYTHONUNBUFFERED=1
 
-# Fix volume ownership if /data is mounted as root (happens when volume is created
-# before the container runs as non-root hermes user). This is idempotent and safe
-# to run every startup.
-if [ -d /data ] && [ "$(stat -c %U /data)" = "root" ]; then
-  chown -R hermes:hermes /data || true
-fi
-
 mkdir -p \
   /data \
   "${HERMES_HOME}" \

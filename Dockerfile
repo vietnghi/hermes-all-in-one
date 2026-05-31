@@ -1,7 +1,5 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
-RUN addgroup --system hermes && adduser --system --ingroup hermes hermes
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates curl git nodejs npm \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -13,11 +11,11 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --chown=hermes:hermes vendor/hermes-agent /app/vendor/hermes-agent
-COPY --chown=hermes:hermes vendor/hermes-webui /app/vendor/hermes-webui
-COPY --chown=hermes:hermes control_plane /app/control_plane
-COPY --chown=hermes:hermes requirements-control-plane.txt /app/requirements-control-plane.txt
-COPY --chown=hermes:hermes start.sh /app/start.sh
+COPY vendor/hermes-agent /app/vendor/hermes-agent
+COPY vendor/hermes-webui /app/vendor/hermes-webui
+COPY control_plane /app/control_plane
+COPY requirements-control-plane.txt /app/requirements-control-plane.txt
+COPY start.sh /app/start.sh
 
 ARG HERMES_WEBUI_VERSION=unknown
 
@@ -28,7 +26,6 @@ RUN printf "__version__ = '%s'\n" "$HERMES_WEBUI_VERSION" > /app/vendor/hermes-w
     && uv pip install --system --no-cache "mcp>=1.24.0" \
     && chmod +x /app/start.sh \
     && mkdir -p /data/.hermes /data/webui /data/workspace \
-    && chown -R hermes:hermes /data \
     && touch /.within_container
 
 ENV HOME=/data \
@@ -42,8 +39,7 @@ ENV HOME=/data \
     HERMES_GATEWAY_AUTOSTART=auto \
     PORT=8787
 
-USER hermes
-
 EXPOSE 8787
 
 CMD ["/app/start.sh"]
+
