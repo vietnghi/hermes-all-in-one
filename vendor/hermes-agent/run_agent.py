@@ -1181,7 +1181,10 @@ class AIAgent:
         normalized_provider = (provider or "").strip().lower()
         # Nous serves GPT-5.x models via its OpenAI-compatible chat
         # completions endpoint; its /v1/responses endpoint returns 404.
-        if normalized_provider == "nous":
+        # OpenCode Go routes all models (including GPT-5.x) through chat completions;
+        # forcing codex_responses here would route the request to api.openai.com
+        # instead of the configured opencode.ai/zen/go/v1 endpoint.
+        if normalized_provider in {"nous", "opencode-go"}:
             return False
         if normalized_provider == "copilot":
             try:

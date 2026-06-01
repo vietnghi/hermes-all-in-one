@@ -4640,6 +4640,7 @@ def _run_agent_streaming(
             # Resolve API key via Hermes runtime provider (matches gateway behaviour).
             # Pass the resolved provider so non-default providers get their own credentials.
             resolved_api_key = None
+            resolved_api_mode = None
             try:
                 from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
                 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -4652,6 +4653,11 @@ def _run_agent_streaming(
                     resolved_provider = _rt.get("provider")
                 if not resolved_base_url:
                     resolved_base_url = _rt.get("base_url")
+                # Carry the api_mode from runtime resolution so providers like
+                # opencode-go (which serve GPT-5.x via chat_completions, not the
+                # Responses API) don't get incorrectly upgraded to codex_responses
+                # by AIAgent's generic GPT-5 detection logic.
+                resolved_api_mode = _rt.get("api_mode") or None
             except Exception as _e:
                 print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
 
@@ -4807,6 +4813,7 @@ def _run_agent_streaming(
                 provider=resolved_provider,
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
                 # Identify browser-originated sessions as WebUI so Hermes Agent
                 # does not inject CLI-specific terminal/output guidance.
                 platform='webui',
