@@ -738,6 +738,7 @@ _FALLBACK_MODELS = [
     # Mistral
     {"provider": "Mistral",   "id": "mistralai/mistral-large-latest",     "label": "Mistral Large"},
     # MiniMax
+    {"provider": "MiniMax", "id": "minimax/minimax-m2.7", "label": "Minimax M2.7"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M3",               "label": "MiniMax M3"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7",             "label": "MiniMax M2.7"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7-highspeed",   "label": "MiniMax M2.7 Highspeed"},
