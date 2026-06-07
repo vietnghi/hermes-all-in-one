@@ -58,7 +58,21 @@ ensure_remote "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_URL"
 
 run git fetch "$AGENT_REMOTE_NAME" "$AGENT_REMOTE_REF"
 run git fetch "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF"
-run git subtree pull --prefix="$AGENT_PREFIX" "$AGENT_REMOTE_NAME" "$AGENT_REMOTE_REF" --squash
+# Use -X theirs so upstream always wins for any conflict inside vendor/hermes-agent.
+# Our local patches to vendor files (e.g. run_agent.py) are re-applied after the pull;
+# they must not be committed directly into the vendor tree to avoid breaking subtree merges.
+run git subtree pull --prefix="$AGENT_PREFIX" "$AGENT_REMOTE_NAME" "$AGENT_REMOTE_REF" --squash -X theirs || {
+  # -X theirs isn't always enough when git subtree loses track of the merge base
+  # (e.g. after a manually-completed merge). Fall back to accepting all upstream files.
+  if [[ -f ".git/MERGE_HEAD" ]]; then
+    echo "[sync] subtree conflict — accepting all upstream vendor/hermes-agent files"
+    git checkout --theirs -- "$AGENT_PREFIX/"
+    git add "$AGENT_PREFIX/"
+    git commit --no-edit
+  else
+    exit 1
+  fi
+}
 
 # Reset config.py to upstream before pulling webui so the patch commit from
 # the previous sync does not conflict with upstream's own edits to that file.
