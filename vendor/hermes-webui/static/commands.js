@@ -17,6 +17,7 @@ const COMMANDS=[
   {name:'theme',     desc:t('cmd_theme'), fn:cmdTheme, arg:'name',  noEcho:true},
   {name:'personality', desc:t('cmd_personality'), fn:cmdPersonality, arg:'name', subArgs:'personalities'},
   {name:'skills',    desc:t('cmd_skills'),   fn:cmdSkills,   arg:'query'},
+  {name:'use',       desc:t('cmd_use'),      fn:cmdUse,      arg:'skill-name', subArgs:'skills', noEcho:true},
   {name:'stop',      desc:t('cmd_stop'),     fn:cmdStop,      noEcho:true},
   {name:'goal',      desc:t('cmd_goal'),     fn:cmdGoal,      arg:'[status|pause|resume|clear|text]', subArgs:['status','pause','resume','clear']},
   {name:'queue',     desc:t('cmd_queue'),    fn:cmdQueue,     arg:'message', noEcho:true},
@@ -94,6 +95,7 @@ function getMatchingCommands(prefix){
   return matches;
 }
 
+let _forcedSkillDirectivePending=null;
 let _slashModelCache=null;
 let _slashModelCachePromise=null;
 let _slashPersonalityCache=null;
@@ -243,7 +245,15 @@ function cliOnlyCommandResponse(cmdName, meta){
   return `\`/${name}\` is a Hermes CLI-only command and cannot run inside the WebUI.${detail}${extra}`;
 }
 
+async function executeAgentCommand(text,_meta){
+  return _runAgentCommandTransport(text,_meta);
+}
+
 async function executeAgentPluginCommand(text,_meta){
+  return _runAgentCommandTransport(text,_meta);
+}
+
+async function _runAgentCommandTransport(text,_meta){
   const command=String(text||'').trim();
   if(!command) throw new Error('command is required');
   const data=await api('/api/commands/exec',{
@@ -281,6 +291,38 @@ async function getSlashAutocompleteMatches(text){
       desc:parsed.command.desc,
       source:'subarg',
       parent:parsed.command.name,
+    }));
+}
+
+function _findComposerPathToken(text,cursor){
+  const value=String(text||'');
+  const rawCursor=Number(cursor);
+  const pos=Number.isFinite(rawCursor)?Math.max(0,Math.min(rawCursor,value.length)):value.length;
+  let start=pos;
+  while(start>0&&!/\s/.test(value.charAt(start-1))) start-=1;
+  let end=pos;
+  while(end<value.length&&!/\s/.test(value.charAt(end))) end+=1;
+  const prefix=value.slice(start,pos);
+  if(!prefix.startsWith('~/')) return null;
+  return {start,end,prefix};
+}
+
+async function getComposerPathAutocompleteMatches(text,cursor){
+  const token=_findComposerPathToken(text,cursor);
+  if(!token||typeof api!=='function') return [];
+  const qs=new URLSearchParams({prefix:token.prefix}).toString();
+  const data=await api(`/api/workspaces/suggest?${qs}`);
+  const needle=token.prefix.toLowerCase();
+  return ((data&&data.suggestions)||[])
+    .map(path=>String(path||''))
+    .filter(path=>path&&path.toLowerCase().startsWith(needle))
+    .map(path=>({
+      name:path,
+      value:path,
+      desc:'Workspace path',
+      source:'path',
+      tokenStart:token.start,
+      tokenEnd:token.end,
     }));
 }
 
@@ -530,13 +572,23 @@ async function cmdWorkspace(args){
 }
 
 async function cmdTerminal(){
+  let data=null;
+  try{
+    data=await api('/api/workspaces');
+    if(typeof syncTerminalBackendState==='function') syncTerminalBackendState(data);
+    if(data&&data.terminal_remote_backend){
+      const msg=typeof _terminalRemoteBackendUnsupportedMessage==='function'
+        ? _terminalRemoteBackendUnsupportedMessage()
+        : 'Embedded terminal is only supported for local terminal backends.';
+      showToast(msg,3200,'warning');
+      if(typeof syncTerminalButton==='function') syncTerminalButton();
+      return;
+    }
+  }catch(_){}
   if(!S.session&&typeof newSession==='function'){
     if(!S._profileSwitchWorkspace&&!S._profileDefaultWorkspace){
-      try{
-        const data=await api('/api/workspaces');
-        const first=(data.workspaces||[])[0];
-        S._profileSwitchWorkspace=data.last||(first&&first.path)||null;
-      }catch(_){}
+      const first=(data&&data.workspaces||[])[0];
+      S._profileSwitchWorkspace=(data&&data.last)||(first&&first.path)||null;
     }
     await newSession();
     if(typeof renderSessionList==='function') await renderSessionList();
@@ -868,6 +920,44 @@ async function cmdSkills(args){
     renderMessages();
     showToast(t('type_slash'));
   }catch(e){
+    showToast('Failed to load skills: '+e.message);
+  }
+}
+
+async function cmdUse(args){
+  if(!args){
+    S.messages.push({role:'assistant',content:'Usage: `/use <skill-name>` — forces the agent to consult that skill before its next response.'});
+    renderMessages();
+    return;
+  }
+  let resolve;
+  const pending = {sessionId:S.session&&S.session.session_id||null,promise:null};
+  pending.promise = new Promise(r => { resolve = r; });
+  _forcedSkillDirectivePending = pending;
+  const isCurrentSession = () => !pending.sessionId || (S.session&&S.session.session_id)===pending.sessionId;
+  try{
+    const data = await api('/api/skills');
+    const skills = data.skills || [];
+    const match = skills.find(s => (s.name||'').toLowerCase() === args.toLowerCase());
+    if(!match){
+      resolve(null);
+      if(_forcedSkillDirectivePending===pending)_forcedSkillDirectivePending = null;
+      if(isCurrentSession()){
+        const msg = {role:'assistant', content:`No skill named \`${args}\`. Use \`/skills\` to see available skills.`};
+        S.messages.push(msg); renderMessages();
+      }
+      return;
+    }
+    const directive = `[USER OVERRIDE] You MUST consult skill '${match.name}' via skill_view before responding to the next message.`;
+    resolve(directive);
+    if(isCurrentSession()){
+      S.messages.push({role:'assistant', content:`Next turn: skill \`${match.name}\` will be forced.`});
+      renderMessages();
+    }
+    showToast(`Skill \`${match.name}\` will be used for next turn.`);
+  }catch(e){
+    resolve(null);
+    if(_forcedSkillDirectivePending===pending)_forcedSkillDirectivePending = null;
     showToast('Failed to load skills: '+e.message);
   }
 }
@@ -1456,16 +1546,37 @@ function showCmdDropdown(matches){
     if(i===_cmdSelectedIdx) el.classList.add('selected');
     el.dataset.idx=i;
     const isSubArg=c.source==='subarg';
+    const isPath=c.source==='path';
     const usage=(!isSubArg&&c.arg)?` <span class="cmd-item-arg">${esc(c.arg)}</span>`:'';
     const badge=c.source==='skill'?`<span class="cmd-item-badge cmd-item-badge-skill">${esc(t('slash_skill_badge'))}</span>`:'';
     if(c.source==='skill') el.classList.add('cmd-item-skill');
-    const nameHtml=isSubArg
+    if(isPath) el.classList.add('cmd-item-path');
+    const nameHtml=isPath
+      ? `<div class="cmd-item-name"><span class="cmd-item-path-value">${esc(c.value)}</span></div>`
+      : isSubArg
       ? `<div class="cmd-item-name"><span class="cmd-item-parent">/${esc(c.parent)}</span> <span class="cmd-item-subarg">${esc(c.value)}</span></div>`
       : `<div class="cmd-item-name">/${esc(c.name)}${usage}${badge}</div>`;
     const descHtml=`<div class="cmd-item-desc">${esc(c.desc)}</div>`;
     el.innerHTML=`${nameHtml}${descHtml}`;
     el.onmousedown=(e)=>{
       e.preventDefault();
+      if(isPath){
+        const ta=$('msg');
+        if(!ta){hideCmdDropdown();return;}
+        const start=Number.isFinite(Number(c.tokenStart))?Number(c.tokenStart):ta.selectionStart;
+        const end=Number.isFinite(Number(c.tokenEnd))?Number(c.tokenEnd):ta.selectionEnd;
+        const nextPath=String(c.value||'').endsWith('/')?String(c.value||''):`${String(c.value||'')}/`;
+        const current=String(ta.value||'');
+        const safeStart=Math.max(0,Math.min(start,current.length));
+        const safeEnd=Math.max(safeStart,Math.min(end,current.length));
+        ta.value=current.slice(0,safeStart)+nextPath+current.slice(safeEnd);
+        const pos=safeStart+nextPath.length;
+        ta.focus();
+        ta.setSelectionRange(pos,pos);
+        ta.dispatchEvent(new Event('input',{bubbles:true}));
+        hideCmdDropdown();
+        return;
+      }
       const nextValue=isSubArg?('/'+c.parent+' '+c.value):('/'+c.name+(c.arg?' ':''));
       $('msg').value=nextValue;
       $('msg').focus();
