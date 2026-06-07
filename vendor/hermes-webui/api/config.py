@@ -791,6 +791,7 @@ _FALLBACK_MODELS = [
     {"provider": "DeepSeek",  "id": "deepseek/deepseek-chat-v3-0324",      "label": "DeepSeek V3 (legacy)"},
     {"provider": "DeepSeek",  "id": "deepseek/deepseek-r1",                "label": "DeepSeek R1 (legacy)"},
     # Qwen (Alibaba) — strong coding and general models
+    {"provider": "Qwen", "id": "qwen/qwen3.7-plus", "label": "Qwen3.7 Plus"},
     {"provider": "Qwen", "id": "qwen/qwen3.6-35b-a3b", "label": "Qwen3.6 35b A3b"},
     {"provider": "Qwen", "id": "qwen/qwen3.7-max", "label": "Qwen3.7 Max"},
     {"provider": "Qwen", "id": "qwen/qwen3.5-35b-a3b", "label": "Qwen3.5 35b A3b"},
