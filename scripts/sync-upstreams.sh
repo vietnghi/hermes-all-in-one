@@ -72,14 +72,16 @@ run git subtree pull --prefix="$AGENT_PREFIX" "$AGENT_REMOTE_NAME" "$AGENT_REMOT
   fi
 }
 
-# Reset config.py to upstream before pulling webui so the patch commit from
-# the previous sync does not conflict with upstream's own edits to that file.
+# Reset config.py to the pre-patch version before pulling webui so the patch
+# commit from the previous sync does not conflict with upstream's own edits.
 WEBUI_CONFIG="${WEBUI_PREFIX}/api/config.py"
-if git log -1 --format="%s" | grep -q "patch webui model" 2>/dev/null || \
-   git log -1 HEAD -- "$WEBUI_CONFIG" --format="%s" | grep -q "patch webui model" 2>/dev/null; then
+LAST_CONFIG_COMMIT=$(git log -1 --format="%s" -- "$WEBUI_CONFIG" 2>/dev/null || true)
+if echo "$LAST_CONFIG_COMMIT" | grep -q "patch webui model"; then
   echo "[sync] reverting patch commit on ${WEBUI_CONFIG} to avoid subtree conflict..."
   git checkout HEAD~1 -- "$WEBUI_CONFIG"
-  git commit -m "chore(sync): revert webui model patch before upstream pull"
+  if ! git diff --cached --quiet; then
+    git commit -m "chore(sync): revert webui model patch before upstream pull"
+  fi
 fi
 
 run git subtree pull --prefix="$WEBUI_PREFIX" "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF" --squash || {
