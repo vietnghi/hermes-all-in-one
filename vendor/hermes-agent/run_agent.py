@@ -4490,7 +4490,7 @@ class AIAgent:
         return reapply_reasoning_echo_for_provider(self, api_messages)
 
     @staticmethod
-    def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
+    def _sanitize_tool_calls_for_strict_api(api_msg: dict, model: str = None) -> dict:
         """Strip Codex Responses API fields from tool_calls for strict providers.
 
         Providers like Mistral, Fireworks, and other strict OpenAI-compatible APIs
