@@ -46,6 +46,12 @@ ensure_remote() {
   fi
 }
 
+# Abort any incomplete subtree merge left by a previous failed run.
+if [[ -f ".git/MERGE_HEAD" ]]; then
+  echo "[sync] incomplete merge detected — aborting before retry"
+  git merge --abort
+fi
+
 ensure_clean_tree
 ensure_remote "$AGENT_REMOTE_NAME" "$AGENT_REMOTE_URL"
 ensure_remote "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_URL"
@@ -53,13 +59,36 @@ ensure_remote "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_URL"
 run git fetch "$AGENT_REMOTE_NAME" "$AGENT_REMOTE_REF"
 run git fetch "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF"
 run git subtree pull --prefix="$AGENT_PREFIX" "$AGENT_REMOTE_NAME" "$AGENT_REMOTE_REF" --squash
-run git subtree pull --prefix="$WEBUI_PREFIX" "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF" --squash
+
+# Reset config.py to upstream before pulling webui so the patch commit from
+# the previous sync does not conflict with upstream's own edits to that file.
+WEBUI_CONFIG="${WEBUI_PREFIX}/api/config.py"
+if git log -1 --format="%s" | grep -q "patch webui model" 2>/dev/null || \
+   git log -1 HEAD -- "$WEBUI_CONFIG" --format="%s" | grep -q "patch webui model" 2>/dev/null; then
+  echo "[sync] reverting patch commit on ${WEBUI_CONFIG} to avoid subtree conflict..."
+  git checkout HEAD~1 -- "$WEBUI_CONFIG"
+  git commit -m "chore(sync): revert webui model patch before upstream pull"
+fi
+
+run git subtree pull --prefix="$WEBUI_PREFIX" "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF" --squash || {
+  # If conflict only in config.py (expected), take upstream and re-patch.
+  conflicts=$(git diff --name-only --diff-filter=U)
+  if [[ "$conflicts" == "$WEBUI_CONFIG" ]]; then
+    echo "[sync] conflict in ${WEBUI_CONFIG} — taking upstream version for re-patching"
+    git checkout --theirs "$WEBUI_CONFIG"
+    git add "$WEBUI_CONFIG"
+    git commit --no-edit
+  else
+    echo "[sync] unexpected conflicts: $conflicts" >&2
+    exit 1
+  fi
+}
 
 echo
 echo "[sync] patching vendor model lists from hermes-agent..."
 python3 "${ROOT_DIR}/scripts/patch-vendor-models.py"
-if ! git diff --quiet vendor/hermes-webui/api/config.py; then
-  git add vendor/hermes-webui/api/config.py
+if ! git diff --quiet "$WEBUI_CONFIG"; then
+  git add "$WEBUI_CONFIG"
   git commit -m "chore(sync): patch webui model list from hermes-agent"
 fi
 
