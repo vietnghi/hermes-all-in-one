@@ -225,6 +225,9 @@ export const en: Translations = {
       discord: "Discord",
       slack: "Slack",
       email: "Email",
+      needsHomeChannel: "set a home channel first",
+      noneConfigured:
+        "No messaging platforms configured. Set one up under Channels to deliver reports.",
     },
   },
 
@@ -429,6 +432,12 @@ export const en: Translations = {
   theme: {
     title: "Theme",
     switchTheme: "Switch theme",
+    fontTitle: "Font",
+    fontDefault: "Theme default",
+    fontDefaultHint: "Use the active theme's font",
+    fontSans: "Sans",
+    fontSerif: "Serif",
+    fontMono: "Mono",
   },
 
   achievements: {
