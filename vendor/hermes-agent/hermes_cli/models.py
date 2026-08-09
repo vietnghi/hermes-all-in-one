@@ -512,6 +512,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimax-m2.5",
         "deepseek-v4-pro",
         "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
         "qwen3.7-max",
         "qwen3.7-plus",
         "qwen3.6-plus",

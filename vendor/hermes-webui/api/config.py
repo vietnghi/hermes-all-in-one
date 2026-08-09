@@ -1904,6 +1904,7 @@ _PROVIDER_MODELS = {
         {"id": "glm-5",            "label": "GLM-5"},
         {"id": "deepseek-v4-pro",  "label": "DeepSeek V4 Pro"},
         {"id": "deepseek-v4-flash","label": "DeepSeek V4 Flash"},
+        {"id": "deepseek-v4-flash-0731", "label": "DeepSeek V4 Flash 0731"},
         {"id": "qwen3.7-max",      "label": "Qwen3.7 Max"},
         {"id": "qwen3.7-plus",     "label": "Qwen3.7 Plus"},
         {"id": "qwen3.6-plus",     "label": "Qwen3.6 Plus"},
