@@ -99,9 +99,15 @@ def test_stream_end_without_done_restores_settled_session_before_closing():
     never replaces the pane with the persisted transcript when done is missing.
     """
     body = _event_body("stream_end")
-    restore_idx = body.find("_restoreSettledSession(source)")
-    close_idx = body.rfind("_closeSource(source)")
-    finalized_idx = body.find("_streamFinalized=true")
+    restore_idx = body.find("_restoreSettledSession(source,{status:true})")
+    if restore_idx == -1:
+        restore_idx = body.find("_restoreSettledSession(source)")
+    close_idx = body.find("_closeSource(source)", restore_idx)
+    if close_idx == -1:
+        close_idx = body.find("_finalizeStreamEndFallback(source)", restore_idx)
+    finalized_idx = body.find("_streamFinalized=true", restore_idx)
+    if finalized_idx == -1:
+        finalized_idx = body.find("_finalizeStreamEndFallback(source)", restore_idx)
     assert restore_idx != -1, "stream_end handler must restore settled session when done is absent"
     assert close_idx != -1, "stream_end handler must still close the owning EventSource"
     assert restore_idx < close_idx, "restore must be attempted before closing the stream"
@@ -113,11 +119,11 @@ def test_settled_restore_and_error_close_only_the_event_source_owner():
     restore_body = _function_body("_restoreSettledSession")
     error_body = _function_body("_handleStreamError")
     event_body = _event_body("error")
-    assert "async function _restoreSettledSession(source)" in MESSAGES_JS
+    assert "async function _restoreSettledSession(source, options=null)" in MESSAGES_JS
     assert "function _handleStreamError(source)" in MESSAGES_JS
     assert "_closeSource(source);" in restore_body
     assert "_closeSource(source);" in error_body
-    assert "_restoreSettledSession(source)" in event_body
+    assert "_restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})" in event_body
     assert "_handleStreamError(source)" in event_body
     assert "_restoreSettledSession())" not in event_body
     assert "_handleStreamError();" not in event_body
@@ -160,6 +166,25 @@ def test_attention_events_use_distinct_sound_from_completion():
     assert "gain.gain.setValueAtTime(0.24,ctx.currentTime);" in attention_body
     assert "osc.stop(ctx.currentTime+0.24);" in attention_body
     assert "Notification sound failed" not in attention_body
+
+
+def test_active_reconnect_uses_run_journal_replay_cursor():
+    """Active-stream reconnects must send replay cursor params too.
+
+    Once StreamChannel's offline buffer drops old frames, a still-active stream
+    can only backfill the dropped gap from the run journal.  Reconnecting without
+    replay/after_seq/after_event_id silently resumes at the retained tail and
+    loses the older gap.
+    """
+    body = _event_body("error")
+    active_status_idx = body.find("if(st&&st.active)")
+    replay_status_idx = body.find("if(st&&st.replay_available)")
+    assert active_status_idx != -1, "active reconnect branch not found"
+    assert replay_status_idx != -1, "replay reconnect branch not found"
+    active_block = body[active_status_idx:replay_status_idx]
+    assert "${_runJournalReplayParams()}" in active_block
+    assert "after_seq" in _function_body("_runJournalReplayParams")
+    assert "after_event_id" in _function_body("_runJournalReplayParams")
 
 
 def test_attach_live_stream_registers_one_source_per_session_stream():

@@ -126,7 +126,7 @@ def _run_helper(driver_path, payload):
         [NODE, driver_path, str(UI_JS_PATH), json.dumps(payload)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed:\nSTDOUT={result.stdout}\nSTDERR={result.stderr}")
@@ -139,7 +139,7 @@ def _run_model_state_helper(driver_path, payload):
         [NODE, driver_path, str(UI_JS_PATH), json.dumps(payload)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed:\nSTDOUT={result.stdout}\nSTDERR={result.stderr}")
@@ -213,6 +213,24 @@ def test_model_state_reads_live_custom_provider_from_option_metadata(driver_path
     })
 
     assert state == {"model": "llama-3.3-custom", "model_provider": "custom:lab"}
+
+
+@node_test
+def test_model_state_does_not_use_unrelated_selected_option_provider(driver_path):
+    # If the requested model is not in the options and differs from the currently
+    # selected option, it should return model_provider = null instead of the selected option's provider.
+    state = _run_model_state_helper(driver_path, {
+        "model": "kilo/minimax/minimax-m3",
+        "initialValue": "qwen3.6:27b-mlx",
+        "options": [{
+            "provider": "ollama",
+            "optionProvider": "ollama",
+            "value": "qwen3.6:27b-mlx",
+        }],
+    })
+
+    assert state == {"model": "kilo/minimax/minimax-m3", "model_provider": None}
+
 
 
 def test_live_custom_models_are_tagged_with_provider_metadata():

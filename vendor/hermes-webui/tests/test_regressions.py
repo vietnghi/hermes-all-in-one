@@ -42,6 +42,24 @@ def make_session(created_list):
     return sid
 
 
+def _make_session_visible(sid):
+    from api.models import Session
+    from tests.conftest import TEST_WORKSPACE
+
+    session = Session(
+        session_id=sid,
+        title="regression-test-delete-R8",
+        workspace=str(TEST_WORKSPACE),
+        model="test",
+        created_at=time.time(),
+        updated_at=time.time(),
+        profile="default",
+        messages=[{"role": "user", "content": "visible row", "timestamp": time.time()}],
+        tool_calls=[],
+    )
+    session.save(touch_updated_at=False)
+
+
 def _make_auth_json_with_credential_pool(
     provider_id: str, pool_entries: list[dict], tmp_dir: pathlib.Path
 ) -> pathlib.Path:
@@ -116,7 +134,8 @@ def test_session_with_tool_calls_in_json_loads_ok(cleanup_test_sessions):
     sid = make_session(cleanup_test_sessions)
 
     # Manually inject tool_calls into the session's JSON file
-    sessions_dir = pathlib.Path(os.environ.get("HERMES_WEBUI_TEST_STATE_DIR", str(pathlib.Path.home() / ".hermes" / "webui-mvp-test"))) / "sessions"
+    from tests._pytest_port import TEST_STATE_DIR
+    sessions_dir = pathlib.Path(os.environ.get("HERMES_WEBUI_TEST_STATE_DIR", str(TEST_STATE_DIR))) / "sessions"
     session_file = sessions_dir / f"{sid}.json"
     if session_file.exists():
         d = json.loads(session_file.read_text())
@@ -134,27 +153,26 @@ def test_session_with_tool_calls_in_json_loads_ok(cleanup_test_sessions):
     cleanup_test_sessions.clear()
 
 
-# ── R4: has_pending not imported in streaming.py (Sprint 10 split regression) ─
+# ── R4: approval check not imported in streaming.py (Sprint 10 split regression) ─
 
 def test_streaming_py_imports_has_pending(cleanup_test_sessions):
-    """R4: api/streaming.py must import or define has_pending.
+    """R4: api/streaming.py must import an approval-check function.
     When missing, the approval check mid-stream caused NameError.
     """
     src = (REPO_ROOT / "api/streaming.py").read_text()
-    assert "has_pending" in src, "has_pending not found in api/streaming.py"
-    # Verify it's imported (not just used)
-    assert "import" in src and "has_pending" in src, \
-        "has_pending must be imported in api/streaming.py"
+    assert "has_blocking_approval" in src, "has_blocking_approval not found in api/streaming.py"
+    assert "import" in src and "has_blocking_approval" in src, \
+        "has_blocking_approval must be imported in api/streaming.py"
 
 
 def test_aiagent_imported_in_streaming(cleanup_test_sessions):
-    """R2b: api/streaming.py must import AIAgent.
+    """R2b: api/streaming.py must resolve AIAgent through the runtime guard.
     When missing, the streaming thread crashed immediately after being spawned.
     """
     src = (REPO_ROOT / "api/streaming.py").read_text()
-    assert "AIAgent" in src, "AIAgent not referenced in api/streaming.py"
-    assert "from run_agent import AIAgent" in src or "import AIAgent" in src, \
-        "AIAgent must be imported in api/streaming.py"
+    assert "get_ai_agent_class" in src, "guarded AIAgent resolver not referenced in api/streaming.py"
+    assert "from api.agent_runtime import" in src and "get_ai_agent_class" in src, \
+        "AIAgent must be resolved through api.agent_runtime in api/streaming.py"
 
 
 # ── R5: SSE loop did not break on cancel event (Sprint 10 bug) ───────────────
@@ -177,10 +195,20 @@ def test_server_py_sse_loop_breaks_on_cancel(cleanup_test_sessions):
     src = (REPO_ROOT / "server.py").read_text()
     routes_src = (REPO_ROOT / "api" / "routes.py").read_text() if (REPO_ROOT / "api" / "routes.py").exists() else ""
     combined = src + routes_src
-    m = re.search(r"if event in \([^)]+\):\s*break", combined)
-    assert m, "SSE break condition not found in server.py or api/routes.py"
-    assert "cancel" in m.group(), \
-        f"'cancel' missing from SSE break condition: {m.group()}"
+    # #6527: the break condition may be an inline tuple ("stream_end", ...) OR
+    # the named SSE_RELAY_CLOSE_EVENTS frozenset. Accept either shape and pin
+    # the BEHAVIOR (cancel closes the relay) against the resolved close set,
+    # not the source syntax.
+    m = re.search(
+        r"if event in (?:SSE_RELAY_CLOSE_EVENTS|\([^)]*cancel[^)]*\)):\s*break",
+        combined,
+    )
+    assert m, "SSE break/close condition not found in server.py or api/routes.py"
+    from api.run_journal import SSE_RELAY_CLOSE_EVENTS
+    assert "cancel" in SSE_RELAY_CLOSE_EVENTS, \
+        f"'cancel' missing from SSE relay close set: {SSE_RELAY_CLOSE_EVENTS}"
+    assert "apperror" in SSE_RELAY_CLOSE_EVENTS, \
+        f"'apperror' missing from SSE relay close set: {SSE_RELAY_CLOSE_EVENTS}"
 
 
 # ── R6: Test cron isolation (Sprint 10) ──────────────────────────────────────
@@ -296,6 +324,8 @@ def test_deleted_session_does_not_appear_in_list(cleanup_test_sessions):
     d, _ = post("/api/session/new", {})
     sid = d["session"]["session_id"]
     post("/api/session/rename", {"session_id": sid, "title": "regression-test-delete-R8"})
+    _make_session_visible(sid)
+    post("/api/session/rename", {"session_id": sid, "title": "regression-test-delete-R8"})
 
     # Verify it appears
     sessions, _ = get("/api/sessions")
@@ -324,7 +354,7 @@ def test_server_delete_prunes_session_index(cleanup_test_sessions):
             text.find('if parsed.path == "/api/session/delete":'),
         )
         if delete_idx >= 0:
-            delete_block = text[delete_idx:delete_idx+1800]
+            delete_block = text[delete_idx:delete_idx+2400]
             assert "prune_session_from_index(sid)" in delete_block, \
                 f"{label} session/delete must prune SESSION_INDEX_FILE"
             return
@@ -339,7 +369,7 @@ def test_server_delete_removes_session_bak_snapshot(cleanup_test_sessions):
         routes_src.find('if parsed.path == "/api/session/delete":'),
     )
     assert delete_idx >= 0, "session/delete handler not found in api/routes.py"
-    delete_block = routes_src[delete_idx:delete_idx+1800]
+    delete_block = routes_src[delete_idx:delete_idx+2400]
     assert "with_suffix('.json.bak').unlink" in delete_block or 'with_suffix(".json.bak").unlink' in delete_block, \
         "session/delete must unlink <sid>.json.bak to avoid later orphan-backup recovery"
 
@@ -426,7 +456,10 @@ def test_loadSession_inflight_restores_live_tool_cards(cleanup_test_sessions):
     """
     src = (REPO_ROOT / "static/sessions.js").read_text()
     # INFLIGHT branch must call appendLiveToolCard
-    inflight_idx = src.find("if(INFLIGHT[sid]){")
+    # Anchor on the Phase-2 INFLIGHT restore branch (the later occurrence); #3899
+    # added an earlier if(INFLIGHT[sid]){ idle-reset block, so .find() would
+    # grab the wrong one. (rfind = the substantive restore branch.)
+    inflight_idx = src.rfind("if(INFLIGHT[sid]){")
     assert inflight_idx >= 0, "INFLIGHT branch not found in loadSession"
     inflight_block = src[inflight_idx:inflight_idx+4200]
     assert "appendLiveToolCard" in inflight_block,         "loadSession INFLIGHT branch must restore live tool cards via appendLiveToolCard"
@@ -531,6 +564,64 @@ def test_session_scoped_message_queue_frontend_wiring(cleanup_test_sessions):
     assert "updateQueueBadge(sid);" in sessions_src
 
 
+def test_queue_card_cross_session_clear_called_before_draft_save(cleanup_test_sessions):
+    """R15c: switching away from one session to another should clear the old
+    session's queue card before the async draft-save await, so stale DOM cannot
+    survive into the destination session.
+    """
+    src = (REPO_ROOT / "static/sessions.js").read_text()
+    block_pattern = re.compile(
+        r"if \(currentSid && currentSid !== sid\) \{\s*"
+        r"if\(typeof window\._clearPendingSelections==='function'\) window\._clearPendingSelections\(\);\s*"
+        r"if\(typeof _clearQueueCardDisplay==='function'\) _clearQueueCardDisplay\(currentSid\);\s*"
+        r"await _saveComposerDraftNow\(currentSid",
+        re.S,
+    )
+    assert block_pattern.search(src), (
+        "cross-session loadSession path must clear queue card display via"
+        " _clearQueueCardDisplay(currentSid) before awaiting _saveComposerDraftNow"
+    )
+
+
+def test_queue_card_cross_session_helper_used_only_for_session_change(cleanup_test_sessions):
+    """R15c: _clearQueueCardDisplay(sid) must only fire on cross-session switches,
+    not on same-session navigation/force-reload code paths.
+    """
+    src = (REPO_ROOT / "static/sessions.js").read_text()
+    load_start = src.find("async function loadSession(sid){")
+    assert load_start >= 0
+    load_end = src.find("  // Sync context usage indicator from session data", load_start)
+    load_body = src[load_start:load_end]
+    cross_start = load_body.find("if (currentSid && currentSid !== sid) {")
+    cross_end = load_body.find("if (currentSid !== sid || forceReload) {", cross_start)
+    assert cross_start >= 0 and cross_end >= 0
+    assert "_clearQueueCardDisplay(currentSid);" in load_body[cross_start:cross_end], (
+        "queue-card clear helper must be inside the cross-session branch"
+    )
+    same_session_idx = load_body.find(
+        "if(currentSid===sid && !forceReload && (!_loadingSessionId || _loadingSessionId===sid)){"
+    )
+    assert same_session_idx >= 0, (
+        "same-session no-op guard must still exist (now a block that first clears "
+        "a stale unread dot before returning) and must precede the cross-session branch"
+    )
+    assert same_session_idx < cross_start
+
+
+def test_queue_card_clear_helper_tracks_render_epoch(cleanup_test_sessions):
+    """R15d: the delayed queue clear must only wipe the chips from the render it
+    was asked to dismiss, not a later render for the same shared queue DOM.
+    """
+    src = (REPO_ROOT / "static/ui.js").read_text()
+    assert "let _queueRenderEpoch=0;" in src
+    assert "if(sid) delete _queueRenderKeys[sid];" in src
+    assert "inner.setAttribute('data-queue-render-sid',sid);" in src
+    assert "inner.setAttribute('data-queue-render-epoch',String(++_queueRenderEpoch));" in src
+    assert "const _epoch=_chips.getAttribute('data-queue-render-epoch')||'';" in src
+    assert "(_chips.getAttribute('data-queue-render-sid')||'')===_sid" in src
+    assert "(_chips.getAttribute('data-queue-render-epoch')||'')===_epoch" in src
+
+
 def test_chat_start_persists_pending_turn_metadata_for_reload_recovery(cleanup_test_sessions):
     """R15c: chat/start must expose enough pending-turn metadata for a reload to
     rebuild the in-flight conversation instead of showing a blank session.
@@ -566,8 +657,11 @@ def test_reload_path_restores_pending_message_and_reattaches_live_stream(cleanup
     assert 'pending_user_message' in ui_src
     assert 'function attachLiveStream' in messages_src
     assert 'const pendingMsg=typeof getPendingSessionMessage' in sessions_src
-    assert ('const activeStreamId=data.session.active_stream_id||null;' in sessions_src or
-            'const activeStreamId=S.session.active_stream_id||null;' in sessions_src)
+    # `activeStreamId` declaration was widened const → let (#5248 race-guard
+    # re-reads it after the awaited message load). Accept either keyword via a
+    # prefix anchor that omits const/let.
+    assert ('activeStreamId=data.session.active_stream_id||null;' in sessions_src or
+            'activeStreamId=S.session.active_stream_id||null;' in sessions_src)
     assert 'attachLiveStream(sid, activeStreamId' in sessions_src
     assert 'if (S.activeStreamId && S.activeStreamId === streamId) return;' in ui_src
     active_branch_start = sessions_src.index("if(activeStreamId){\n      S.busy=true;")
@@ -647,26 +741,32 @@ def test_loadSession_inflight_sets_busy_before_renderMessages(cleanup_test_sessi
     session switch.
     """
     src = (REPO_ROOT / "static/sessions.js").read_text()
-    inflight_idx = src.find("if(INFLIGHT[sid]){")
+    # Anchor on the Phase-2 INFLIGHT restore branch (the later occurrence); #3899
+    # added an earlier if(INFLIGHT[sid]){ idle-reset block, so .find() would
+    # grab the wrong one. (rfind = the substantive restore branch.)
+    inflight_idx = src.rfind("if(INFLIGHT[sid]){")
     assert inflight_idx >= 0, "INFLIGHT branch not found in loadSession"
     inflight_block = src[inflight_idx:inflight_idx+4200]
-    busy_pos = inflight_block.find("S.busy=true;")
+    busy_pos = inflight_block.find("S.busy=")
     # #3326 added an optional {preserveScroll} arg to the INFLIGHT-branch render
     # call, so match the call form rather than the bare `renderMessages();`.
     render_pos = inflight_block.find("renderMessages(")
-    assert busy_pos >= 0, "loadSession INFLIGHT branch must set S.busy=true"
+    assert busy_pos >= 0, "loadSession INFLIGHT branch must set S.busy"
     assert render_pos >= 0, "loadSession INFLIGHT branch must call renderMessages()"
     assert busy_pos < render_pos, \
-        "loadSession must set S.busy=true before renderMessages() to avoid duplicate tool cards"
+        "loadSession must set S.busy before renderMessages() to avoid duplicate tool cards"
 
 
 def test_loadSession_inflight_merges_tail_with_persisted_transcript(cleanup_test_sessions):
     src = (REPO_ROOT / "static/sessions.js").read_text()
-    inflight_idx = src.find("if(INFLIGHT[sid]){")
+    # Anchor on the Phase-2 INFLIGHT restore branch (the later occurrence); #3899
+    # added an earlier if(INFLIGHT[sid]){ idle-reset block, so .find() would
+    # grab the wrong one. (rfind = the substantive restore branch.)
+    inflight_idx = src.rfind("if(INFLIGHT[sid]){")
     assert inflight_idx >= 0, "INFLIGHT branch not found in loadSession"
     inflight_block = src[inflight_idx:inflight_idx+1200]
 
-    assert "await _ensureMessagesLoaded(sid);" in inflight_block, (
+    assert "await _ensureMessagesLoaded(sid" in inflight_block, (
         "returning to an active stream should load the persisted transcript before adding the live tail"
     )
     assert "_mergeInflightTailMessages(S.messages,inflightMessages)" in inflight_block, (
@@ -730,10 +830,13 @@ def test_inflight_merge_dedupes_uploaded_user_message(cleanup_test_sessions):
     merge must treat those as the same user turn instead of rendering both.
     """
     src = (REPO_ROOT / "static/sessions.js").read_text()
-    assert "function _stripAttachedFilesMarker" in src, (
-        "sessions.js must normalize the server-side attached-files suffix before deduping user turns"
+    assert "function _normalizeUserTranscriptText" in src, (
+        "sessions.js should normalize user transcript text before deduping user turns"
     )
-    assert "_stripAttachedFilesMarker(aText)===_stripAttachedFilesMarker(bText)" in src, (
+    assert "_stripAttachedFilesMarker(_stripForcedSkillEnvelope(text))" in src, (
+        "user transcript normalization should still remove the server-side attached-files suffix"
+    )
+    assert "_normalizeUserTranscriptText(aText)===_normalizeUserTranscriptText(bText)" in src, (
         "INFLIGHT user-message comparison should dedupe optimistic upload text against final pending text"
     )
     assert "role==='user'" in src, (
@@ -742,8 +845,11 @@ def test_inflight_merge_dedupes_uploaded_user_message(cleanup_test_sessions):
     pending_idx = src.find("function _mergePendingSessionMessage")
     assert pending_idx >= 0, "pending session merge helper not found"
     pending_block = src[pending_idx:pending_idx+500]
-    assert "_sameTranscriptMessage(existing,pendingMsg)" in pending_block, (
-        "pending-user merge should reuse transcript identity dedupe before inserting the server pending message"
+    assert "_hasCurrentTailUserDuplicate(currentTurnMessages,pendingMsg)" in pending_block, (
+        "pending-user merge should dedupe only against the current active-turn user row"
+    )
+    assert "messages.some(" not in pending_block, (
+        "pending-user merge must not scan historical user rows by normalized content"
     )
 
 
@@ -756,7 +862,10 @@ def test_loadSession_inflight_sets_active_stream_before_replaying_live_tool_card
     counter drops the previously-seen tools after a focus change.
     """
     src = (REPO_ROOT / "static/sessions.js").read_text()
-    inflight_idx = src.find("if(INFLIGHT[sid]){")
+    # Anchor on the Phase-2 INFLIGHT restore branch (the later occurrence); #3899
+    # added an earlier if(INFLIGHT[sid]){ idle-reset block, so .find() would
+    # grab the wrong one. (rfind = the substantive restore branch.)
+    inflight_idx = src.rfind("if(INFLIGHT[sid]){")
     assert inflight_idx >= 0, "INFLIGHT branch not found in loadSession"
     inflight_block = src[inflight_idx:inflight_idx+4200]
     active_pos = inflight_block.find("S.activeStreamId=activeStreamId;")
@@ -837,8 +946,16 @@ def test_messages_js_supports_live_reasoning_and_tool_completion(cleanup_test_se
         "messages.js must listen for live reasoning SSE events"
     assert "liveReasoningText += text" in src, \
         "live reasoning SSE events must update the active Worklog Thinking Card text"
-    assert "_updateLiveThinkingCard(_liveThinkingText())" in src, \
-        "live reasoning SSE events must refresh the current segment's Worklog Thinking Card"
+    assert "const liveThinkingText=_liveThinkingText();" in src, \
+        "live reasoning SSE events must compute the current segment's Worklog Thinking Card text once"
+    assert "const anchorReasoningFallback={};" in src, \
+        "live reasoning SSE events must capture the active anchor id for fallback"
+    assert "if(!_upsertAnchorReasoning(liveThinkingText, anchorReasoningFallback))" in src, \
+        "live reasoning SSE events must prefer the anchor renderer before falling back"
+    assert "_updateLiveThinkingCard(liveThinkingText,{" in src and "...anchorReasoningFallback" in src, \
+        "live reasoning SSE events must carry anchor identity into the fallback renderer"
+    assert "anchorRenderFallback:true" in src and "sessionId:activeSid" in src and "streamId" in src, \
+        "live reasoning SSE events must keep the current segment's Worklog Thinking Card as fallback"
     assert "source.addEventListener('tool_complete'" in src or 'source.addEventListener("tool_complete"' in src, \
         "messages.js must listen for live tool completion SSE events"
     assert "function _parseStreamState()" in src, \
@@ -917,7 +1034,7 @@ def test_ui_js_does_not_hide_anchor_segments_that_contain_thinking(cleanup_test_
         "provider reasoning metadata should feed the Worklog Thinking Card after exact duplicate suppression"
     assert "data-worklog-thinking-card" in src, \
         "Thinking Cards should be explicit Worklog items, not tool cards"
-    assert "_thinkingActivityNode(thinkingText, false)" in src, \
+    assert "_thinkingActivityNode(thinkingText, false, thinkingDisclosureKey)" in src, \
         "settled reasoning should render as a collapsed Worklog Thinking Card"
 
 
@@ -936,8 +1053,61 @@ def test_messages_js_live_assistant_segment_reuses_live_turn_wrapper(cleanup_tes
         "live answer content should be appended as a segment inside the live turn wrapper"
     assert "if(!force&&!assistantRow){" in src.replace(' ', ''), \
         "ensureAssistantRow must still avoid creating the live answer segment when no display text exists yet"
-    assert "if(String((parsed&&parsed.displayText)||'').trim()||assistantRow) ensureAssistantRow();" in src, \
+    token_start = src.find("source.addEventListener('token'")
+    interim_start = src.find("source.addEventListener('interim_assistant'", token_start)
+    assert token_start >= 0 and interim_start > token_start
+    token_body = src[token_start:interim_start]
+    compact_token_body = token_body.replace(" ", "").replace("\n", "")
+    assert "if(assistantRow){ensureAssistantRow();_scheduleRender();}" in compact_token_body, \
+        "token handler should skip the per-token full-text parse after the live answer segment exists"
+    assert "constparsed=_parseStreamState();if(String((parsed&&parsed.displayText)||'').trim())ensureAssistantRow();_scheduleRender(parsed);" in compact_token_body, \
         "token handler must only create the live answer segment once visible answer text starts"
+
+
+def test_messages_js_stream_perf_cleanup_lifecycle(cleanup_test_sessions):
+    """#5455 review: throttled snapshot timers and incremental anchor caches tear down at terminal events."""
+    src = (REPO_ROOT / "static/messages.js").read_text()
+    assert "function _cancelThrottledSnapshotTimer()" in src
+    assert "clearTimeout(_snapshotLiveTurnTimer)" in src
+    assert "function _clearAnchorProseIncrementalNode()" in src
+    assert "window.__anchorProseIncrementalNode===_anchorProseIncrementalNode" in src
+    assert "_anchorProseSmdCache.clear();" in src
+    fallback_start = src.find("function _finalizeStreamEndFallback")
+    recovery_start = src.find("async function _runStreamEndRecovery", fallback_start)
+    assert fallback_start >= 0 and recovery_start > fallback_start
+    fallback_body = src[fallback_start:recovery_start]
+    assert "_cancelThrottledSnapshotTimer();" in fallback_body
+    assert "_clearAnchorProseIncrementalNode();" in fallback_body
+    done_start = src.find("source.addEventListener('done'")
+    stream_end_start = src.find("source.addEventListener('stream_end'", done_start)
+    assert done_start >= 0 and stream_end_start > done_start
+    done_body = src[done_start:stream_end_start]
+    assert "_cancelThrottledSnapshotTimer();" in done_body
+    assert "_clearAnchorProseIncrementalNode();" in done_body
+
+    # #5466 Codex gate: the snapshot/anchor cleanup must run on EVERY terminal
+    # path, not just fallback/done/stream_end — otherwise a timer/cache/global
+    # survives the turn on apperror, cancel, stream-error, and the settled-session
+    # recovery path (the PR's own stated teardown invariant).
+    def _terminal_body(anchor, end_marker):
+        a = src.find(anchor)
+        assert a >= 0, f"missing terminal handler: {anchor}"
+        b = src.find(end_marker, a)
+        assert b > a, f"could not bound terminal handler: {anchor}"
+        return src[a:b]
+
+    apperror_body = _terminal_body("source.addEventListener('apperror'", "_streamFadeCleanupReduceMotionListener();")
+    assert "_cancelThrottledSnapshotTimer();" in apperror_body and "_clearAnchorProseIncrementalNode();" in apperror_body, \
+        "apperror terminal handler must tear down the snapshot timer + anchor prose cache"
+    cancel_body = _terminal_body("source.addEventListener('cancel'", "_streamFadeCleanupReduceMotionListener();")
+    assert "_cancelThrottledSnapshotTimer();" in cancel_body and "_clearAnchorProseIncrementalNode();" in cancel_body, \
+        "cancel terminal handler must tear down the snapshot timer + anchor prose cache"
+    stream_error_body = _terminal_body("function _handleStreamError(source)", "_streamFadeCleanupReduceMotionListener();")
+    assert "_cancelThrottledSnapshotTimer();" in stream_error_body and "_clearAnchorProseIncrementalNode();" in stream_error_body, \
+        "_handleStreamError must tear down the snapshot timer + anchor prose cache"
+    restore_body = _terminal_body("async function _restoreSettledSession(source", "_cancelAnimationFramePendingStreamRender();")
+    assert "_cancelThrottledSnapshotTimer();" in restore_body and "_clearAnchorProseIncrementalNode();" in restore_body, \
+        "_restoreSettledSession terminal recovery must tear down the snapshot timer + anchor prose cache"
 
 
 def test_messages_js_finalizes_thinking_card_before_tool_card(cleanup_test_sessions):

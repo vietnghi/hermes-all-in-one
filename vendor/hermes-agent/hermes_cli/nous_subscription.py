@@ -29,6 +29,23 @@ _DEFAULT_PLATFORM_TOOLSETS = {
     "cli": "hermes-cli",
 }
 
+# Maps a tools_config provider's ``managed_nous_feature`` to the tool-pool
+# coverage category (hermes_cli.nous_account.TOOL_COVERAGE_CATEGORIES). Lets the
+# `hermes tools` picker scope its entitlement gate to the selected backend, so a
+# free-tool-pool user is allowed image gen but denied video gen at select time —
+# consistent with the per-category feature gates in get_nous_subscription_features.
+MANAGED_FEATURE_COVERAGE_CATEGORY: Dict[str, str] = {
+    "web": "firecrawl",
+    "image_gen": "fal",
+    "video_gen": "fal-video",
+    "tts": "openai-audio",
+    # STT shares the TTS coverage category: both ride the managed
+    # "openai-audio" gateway endpoint (speech + transcriptions).
+    "stt": "openai-audio",
+    "browser": "browser-use",
+    "modal": "modal",
+}
+
 
 def _uses_gateway(section: object) -> bool:
     """Return True when a config section explicitly opts into the gateway."""
@@ -72,6 +89,10 @@ class NousSubscriptionFeatures:
         return self.features["tts"]
 
     @property
+    def stt(self) -> NousFeatureState:
+        return self.features["stt"]
+
+    @property
     def browser(self) -> NousFeatureState:
         return self.features["browser"]
 
@@ -84,7 +105,7 @@ class NousSubscriptionFeatures:
         return self.features["modal"]
 
     def items(self) -> Iterable[NousFeatureState]:
-        ordered = ("web", "image_gen", "video_gen", "tts", "browser", "modal")
+        ordered = ("web", "image_gen", "video_gen", "tts", "stt", "browser", "modal")
         for key in ordered:
             yield self.features[key]
 
@@ -138,11 +159,35 @@ def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
 def _has_agent_browser() -> bool:
     import shutil
 
-    agent_browser_bin = shutil.which("agent-browser")
-    local_bin = (
-        Path(__file__).parent.parent / "node_modules" / ".bin" / "agent-browser"
-    )
-    return bool(agent_browser_bin or local_bin.exists())
+    from hermes_constants import agent_browser_runnable, with_hermes_node_path
+
+    # Validate the resolved binary actually runs — a dangling global symlink
+    # (issue #48521) is reported by ``which`` but fails at exec. Fall through to
+    # the local node_modules copy, which the validator also checks.
+    if agent_browser_runnable(shutil.which("agent-browser")):
+        return True
+
+    # Hermes-managed Node dirs (Windows installer / POSIX $HERMES_HOME/node)
+    # are prepended to PATH at runtime but usually absent from the *probe*
+    # process's PATH — the same rung `_find_agent_browser` searches. Without
+    # it a successful install keeps reporting "needs setup" on Windows.
+    managed_path = with_hermes_node_path().get("PATH", "")
+    if managed_path:
+        managed_hit = shutil.which("agent-browser", path=managed_path)
+        if managed_hit and agent_browser_runnable(managed_hit):
+            return True
+
+    # Local node_modules/.bin: resolve via PATHEXT-aware ``shutil.which`` so
+    # Windows picks the executable ``.cmd`` shim. Probing the extensionless
+    # POSIX shim directly fails exec (WinError 193) even right after a
+    # successful ``npm install`` — the bug that pinned every browser row on
+    # "Setup required" in the desktop GUI.
+    local_bin_dir = Path(__file__).parent.parent / "node_modules" / ".bin"
+    if local_bin_dir.is_dir():
+        local_which = shutil.which("agent-browser", path=str(local_bin_dir))
+        if local_which and agent_browser_runnable(local_which):
+            return True
+    return False
 
 
 def _local_browser_runnable() -> bool:
@@ -193,6 +238,34 @@ def _tts_label(current_provider: str) -> str:
         "neutts": "NeuTTS",
     }
     return mapping.get(current_provider or "edge", current_provider or "Edge TTS")
+
+
+def _stt_label(current_provider: str) -> str:
+    mapping = {
+        "openai": "OpenAI Whisper",
+        "groq": "Groq Whisper",
+        "mistral": "Mistral Voxtral Transcribe",
+        "local": "Local faster-whisper",
+    }
+    return mapping.get(current_provider or "local", current_provider or "Local faster-whisper")
+
+
+def _local_stt_backend_available() -> bool:
+    """Whether a local STT backend could serve transcription right now.
+
+    True when faster-whisper is importable or a custom local STT command
+    is configured. Used both for feature detection and to stop
+    ``apply_nous_managed_defaults`` from flipping a working local setup
+    to the managed gateway.
+    """
+    if get_env_value("HERMES_LOCAL_STT_COMMAND"):
+        return True
+    try:
+        from tools.transcription_tools import _HAS_FASTER_WHISPER
+
+        return bool(_HAS_FASTER_WHISPER)
+    except Exception:
+        return False
 
 
 def _resolve_browser_feature_state(
@@ -290,12 +363,18 @@ def get_nous_subscription_features(
     except Exception:
         account_info = None
 
+    # Coarse "entitled to any managed tool" gate: paid access OR a live free
+    # tool pool. Per-backend availability is then narrowed by coverage below
+    # (the pool funds image but not video, etc.).
     managed_tools_flag = bool(
         account_info
         and account_info.logged_in
-        and account_info.paid_service_access is True
+        and account_info.tool_gateway_entitled
     )
     nous_auth_present = bool(account_info and account_info.logged_in)
+
+    def _entitled_for(category: str) -> bool:
+        return bool(account_info and account_info.tool_gateway_entitled_for(category))
     subscribed = provider_is_nous or nous_auth_present
 
     web_tool_enabled = _toolset_enabled(config, "web")
@@ -307,6 +386,7 @@ def get_nous_subscription_features(
 
     web_cfg = config.get("web") if isinstance(config.get("web"), dict) else {}
     tts_cfg = config.get("tts") if isinstance(config.get("tts"), dict) else {}
+    stt_cfg = config.get("stt") if isinstance(config.get("stt"), dict) else {}
     browser_cfg = config.get("browser") if isinstance(config.get("browser"), dict) else {}
     terminal_cfg = config.get("terminal") if isinstance(config.get("terminal"), dict) else {}
 
@@ -314,8 +394,12 @@ def get_nous_subscription_features(
     # Per-capability overrides: if set, they determine which backend is active for
     # search/extract independently of web.backend.
     web_search_backend = str(web_cfg.get("search_backend") or "").strip().lower()
-    web_extract_backend = str(web_cfg.get("extract_backend") or "").strip().lower()
     tts_provider = str(tts_cfg.get("provider") or "edge").strip().lower()
+    # STT default is "local" (faster-whisper) per DEFAULT_CONFIG, which
+    # requires `pip install faster-whisper`. For Nous subscribers we'd
+    # rather route through the managed OpenAI audio gateway — see
+    # apply_nous_managed_defaults below.
+    stt_provider = str(stt_cfg.get("provider") or "local").strip().lower()
     browser_provider_explicit = "cloud_provider" in browser_cfg
     browser_provider = normalize_browser_cloud_provider(
         browser_cfg.get("cloud_provider") if browser_provider_explicit else None
@@ -332,6 +416,7 @@ def get_nous_subscription_features(
     # prevent gateway routing.
     web_use_gateway = _uses_gateway(web_cfg)
     tts_use_gateway = _uses_gateway(tts_cfg)
+    stt_use_gateway = _uses_gateway(stt_cfg)
     browser_use_gateway = _uses_gateway(browser_cfg)
     image_gen_cfg = config.get("image_gen") if isinstance(config.get("image_gen"), dict) else {}
     image_use_gateway = _uses_gateway(image_gen_cfg)
@@ -352,6 +437,22 @@ def get_nous_subscription_features(
     direct_browser_use = bool(get_env_value("BROWSER_USE_API_KEY"))
     direct_modal = has_direct_modal_credentials()
 
+    # STT direct providers. OpenAI Whisper reuses the same audio key as
+    # OpenAI TTS — resolve_openai_audio_api_key() reads VOICE_TOOLS_OPENAI_KEY
+    # and falls back to OPENAI_API_KEY. The local provider's "direct"
+    # signal is whether faster-whisper is importable; we lazy-import so
+    # this module stays cheap on the happy path.
+    direct_openai_stt = bool(resolve_openai_audio_api_key())
+    direct_groq_stt = bool(get_env_value("GROQ_API_KEY"))
+    direct_mistral_stt = bool(get_env_value("MISTRAL_API_KEY"))
+    try:
+        from tools.transcription_tools import _HAS_FASTER_WHISPER
+        local_stt_available = bool(_HAS_FASTER_WHISPER) or bool(
+            get_env_value("HERMES_LOCAL_STT_COMMAND")
+        )
+    except Exception:
+        local_stt_available = bool(get_env_value("HERMES_LOCAL_STT_COMMAND"))
+
     # When use_gateway is set, suppress direct credentials for managed detection
     if web_use_gateway:
         direct_firecrawl = False
@@ -365,17 +466,58 @@ def get_nous_subscription_features(
     if tts_use_gateway:
         direct_openai_tts = False
         direct_elevenlabs = False
+    if stt_use_gateway:
+        direct_openai_stt = False
+        direct_groq_stt = False
+        direct_mistral_stt = False
+        local_stt_available = False
     if browser_use_gateway:
         direct_browser_use = False
         direct_browserbase = False
 
-    managed_web_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("firecrawl")
-    managed_image_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("fal-queue")
-    # Video gen uses the same fal-queue gateway as image gen.
-    managed_video_available = managed_image_available
-    managed_tts_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("openai-audio")
-    managed_browser_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("browser-use")
-    managed_modal_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("modal")
+    managed_web_available = (
+        managed_tools_flag
+        and nous_auth_present
+        and is_managed_tool_gateway_ready("firecrawl")
+        and _entitled_for("firecrawl")
+    )
+    managed_image_available = (
+        managed_tools_flag
+        and nous_auth_present
+        and is_managed_tool_gateway_ready("fal-queue")
+        and _entitled_for("fal")
+    )
+    # Video gen rides the same fal-queue gateway as image gen, but the free tool
+    # pool funds image and NOT video — so gate it on its own coverage category
+    # rather than aliasing it to image. (Paid users are entitled to both.)
+    managed_video_available = (
+        managed_tools_flag
+        and nous_auth_present
+        and is_managed_tool_gateway_ready("fal-queue")
+        and _entitled_for("fal-video")
+    )
+    managed_tts_available = (
+        managed_tools_flag
+        and nous_auth_present
+        and is_managed_tool_gateway_ready("openai-audio")
+        and _entitled_for("openai-audio")
+    )
+    # STT and TTS share the same managed gateway endpoint ("openai-audio")
+    # because the OpenAI audio API covers both /audio/speech (TTS) and
+    # /audio/transcriptions (STT). One probe (and one entitlement), used by both.
+    managed_stt_available = managed_tts_available
+    managed_browser_available = (
+        managed_tools_flag
+        and nous_auth_present
+        and is_managed_tool_gateway_ready("browser-use")
+        and _entitled_for("browser-use")
+    )
+    managed_modal_available = (
+        managed_tools_flag
+        and nous_auth_present
+        and is_managed_tool_gateway_ready("modal")
+        and _entitled_for("modal")
+    )
     modal_state = resolve_modal_backend_state(
         modal_mode,
         has_direct=direct_modal,
@@ -428,6 +570,24 @@ def get_nous_subscription_features(
         or (tts_current_provider == "mistral" and bool(get_env_value("MISTRAL_API_KEY")))
     )
     tts_active = bool(tts_tool_enabled and tts_available)
+
+    # STT availability per provider. Unlike TTS, STT isn't a model-callable
+    # tool — the gateway voice middleware calls it on every inbound voice
+    # message — so toolset_enabled is N/A and we treat stt as always
+    # "enabled" if a usable provider is configured.
+    stt_current_provider = stt_provider or "local"
+    stt_managed = (
+        stt_current_provider == "openai"
+        and managed_stt_available
+        and not direct_openai_stt
+    )
+    stt_available = bool(
+        (stt_current_provider == "local" and local_stt_available)
+        or (stt_current_provider == "openai" and (managed_stt_available or direct_openai_stt))
+        or (stt_current_provider == "groq" and direct_groq_stt)
+        or (stt_current_provider == "mistral" and direct_mistral_stt)
+    )
+    stt_active = stt_available
 
     browser_local_available = _has_agent_browser()
     browser_local_runnable = _local_browser_runnable()
@@ -485,6 +645,13 @@ def get_nous_subscription_features(
     if isinstance(raw_tts_cfg, dict) and "provider" in raw_tts_cfg:
         tts_explicit_configured = tts_provider not in {"", "edge"}
 
+    # STT considers any non-default provider explicit. "local" is the
+    # DEFAULT_CONFIG seed, so seeing it doesn't mean the user picked it.
+    stt_explicit_configured = False
+    raw_stt_cfg = config.get("stt")
+    if isinstance(raw_stt_cfg, dict) and "provider" in raw_stt_cfg:
+        stt_explicit_configured = stt_provider not in {"", "local"}
+
     features = {
         "web": NousFeatureState(
             key="web",
@@ -534,6 +701,21 @@ def get_nous_subscription_features(
             current_provider=_tts_label(tts_current_provider),
             explicit_configured=tts_explicit_configured,
         ),
+        "stt": NousFeatureState(
+            key="stt",
+            label="Speech-to-text",
+            included_by_default=True,
+            available=stt_available,
+            active=stt_active,
+            managed_by_nous=stt_managed,
+            direct_override=stt_active and not stt_managed,
+            # STT isn't toolset-gated (gateway middleware calls it
+            # unconditionally on inbound voice), so report True so the
+            # status display doesn't flag it as "tool disabled".
+            toolset_enabled=True,
+            current_provider=_stt_label(stt_current_provider),
+            explicit_configured=stt_explicit_configured,
+        ),
         "browser": NousFeatureState(
             key="browser",
             label="Browser automation",
@@ -582,7 +764,7 @@ def apply_nous_managed_defaults(
     if not (
         features.account_info
         and features.account_info.logged_in
-        and features.account_info.paid_service_access is True
+        and features.account_info.tool_gateway_entitled
     ):
         return set()
     if not features.provider_is_nous:
@@ -600,6 +782,11 @@ def apply_nous_managed_defaults(
     if not isinstance(tts_cfg, dict):
         tts_cfg = {}
         config["tts"] = tts_cfg
+
+    stt_cfg = config.get("stt")
+    if not isinstance(stt_cfg, dict):
+        stt_cfg = {}
+        config["stt"] = stt_cfg
 
     browser_cfg = config.get("browser")
     if not isinstance(browser_cfg, dict):
@@ -622,6 +809,30 @@ def apply_nous_managed_defaults(
         tts_cfg["provider"] = "openai"
         changed.add("tts")
 
+    # STT: same pattern as TTS. The DEFAULT_CONFIG seed is "local"
+    # (requires `pip install faster-whisper`); for Nous subscribers we
+    # flip it to "openai" so the managed audio gateway handles transcription
+    # via the same auth as TTS. Skipped when the user has explicitly
+    # configured STT, has direct credentials for a non-managed provider,
+    # has a working local backend (faster-whisper installed or a custom
+    # local command — strong intent signal that "local" was a choice, not
+    # just the DEFAULT_CONFIG seed), or isn't entitled to the managed
+    # "openai-audio" category (flipping would point at a gateway that
+    # refuses them, silently breaking voice transcription).
+    if (
+        not features.stt.explicit_configured
+        and not _local_stt_backend_available()
+        and not (
+            resolve_openai_audio_api_key()
+            or get_env_value("GROQ_API_KEY")
+            or get_env_value("MISTRAL_API_KEY")
+        )
+        and features.account_info is not None
+        and features.account_info.tool_gateway_entitled_for("openai-audio")
+    ):
+        stt_cfg["provider"] = "openai"
+        changed.add("stt")
+
     if "browser" in selected_toolsets and not features.browser.explicit_configured and not (
         get_env_value("BROWSER_USE_API_KEY")
         or get_env_value("BROWSERBASE_API_KEY")
@@ -637,7 +848,13 @@ def apply_nous_managed_defaults(
         image_cfg["use_gateway"] = True
         changed.add("image_gen")
 
-    if "video_gen" in selected_toolsets and not fal_key_is_configured():
+    # Video gen is not funded by the free tool pool, so only wire managed video
+    # defaults for users entitled to it (paid). Pool-only users keep video off.
+    if (
+        "video_gen" in selected_toolsets
+        and not fal_key_is_configured()
+        and features.account_info.tool_gateway_entitled_for("fal-video")
+    ):
         video_cfg = config.get("video_gen")
         if not isinstance(video_cfg, dict):
             video_cfg = {}
@@ -658,6 +875,7 @@ _GATEWAY_TOOL_LABELS = {
     "image_gen": "Image generation (FAL)",
     "video_gen": "Video generation (FAL)",
     "tts": "Text-to-speech (OpenAI TTS)",
+    "stt": "Speech-to-text (OpenAI Whisper)",
     "browser": "Browser automation (Browser Use)",
 }
 
@@ -679,6 +897,15 @@ def _get_gateway_direct_credentials() -> Dict[str, bool]:
             resolve_openai_audio_api_key()
             or get_env_value("ELEVENLABS_API_KEY")
         ),
+        # STT direct credentials. OpenAI Whisper shares the audio key
+        # with TTS via resolve_openai_audio_api_key() — counting it here
+        # too is intentional: if the user has an OpenAI audio key they
+        # don't need the gateway for either.
+        "stt": bool(
+            resolve_openai_audio_api_key()
+            or get_env_value("GROQ_API_KEY")
+            or get_env_value("MISTRAL_API_KEY")
+        ),
         "browser": bool(
             get_env_value("BROWSER_USE_API_KEY")
             or (get_env_value("BROWSERBASE_API_KEY") and get_env_value("BROWSERBASE_PROJECT_ID"))
@@ -691,10 +918,11 @@ _GATEWAY_DIRECT_LABELS = {
     "image_gen": "FAL key",
     "video_gen": "FAL key",
     "tts": "OpenAI/ElevenLabs key",
+    "stt": "OpenAI/Groq/Mistral key",
     "browser": "Browser Use/Browserbase key",
 }
 
-_ALL_GATEWAY_KEYS = ("web", "image_gen", "video_gen", "tts", "browser")
+_ALL_GATEWAY_KEYS = ("web", "image_gen", "video_gen", "tts", "stt", "browser")
 
 
 def get_gateway_eligible_tools(
@@ -711,11 +939,14 @@ def get_gateway_eligible_tools(
     All lists are empty when the user is not a paid Nous subscriber or
     is not using Nous as their provider.
     """
-    if force_fresh:
-        managed_enabled = managed_nous_tools_enabled(force_fresh=True)
-    else:
-        managed_enabled = managed_nous_tools_enabled()
-    if not managed_enabled:
+    # Fetch entitlement once: it gates the offer (paid access OR a live free tool
+    # pool) AND tells us which categories are covered (the pool funds image but
+    # not video, etc.). Fails closed on any error.
+    try:
+        account_info = get_nous_portal_account_info(force_fresh=force_fresh)
+    except Exception:
+        return [], [], []
+    if not (account_info and account_info.logged_in and account_info.tool_gateway_entitled):
         return [], [], []
 
     if config is None:
@@ -737,6 +968,7 @@ def get_gateway_eligible_tools(
         "image_gen": _uses_gateway(config.get("image_gen")),
         "video_gen": _uses_gateway(config.get("video_gen")),
         "tts": _uses_gateway(config.get("tts")),
+        "stt": _uses_gateway(config.get("stt")),
         "browser": _uses_gateway(config.get("browser")),
     }
 
@@ -744,6 +976,13 @@ def get_gateway_eligible_tools(
     has_direct: list[str] = []
     already_managed: list[str] = []
     for key in _ALL_GATEWAY_KEYS:
+        # Only offer tools the user's entitlement actually covers. For a free
+        # tool pool that means image but not video; paid users are covered for
+        # everything.
+        if not account_info.tool_gateway_entitled_for(
+            MANAGED_FEATURE_COVERAGE_CATEGORY[key]
+        ):
+            continue
         if opted_in.get(key):
             already_managed.append(key)
         elif direct.get(key):
@@ -776,6 +1015,11 @@ def apply_gateway_defaults(
         tts_cfg = {}
         config["tts"] = tts_cfg
 
+    stt_cfg = config.get("stt")
+    if not isinstance(stt_cfg, dict):
+        stt_cfg = {}
+        config["stt"] = stt_cfg
+
     browser_cfg = config.get("browser")
     if not isinstance(browser_cfg, dict):
         browser_cfg = {}
@@ -790,6 +1034,11 @@ def apply_gateway_defaults(
         tts_cfg["provider"] = "openai"
         tts_cfg["use_gateway"] = True
         changed.add("tts")
+
+    if "stt" in tool_keys:
+        stt_cfg["provider"] = "openai"
+        stt_cfg["use_gateway"] = True
+        changed.add("stt")
 
     if "browser" in tool_keys:
         browser_cfg["cloud_provider"] = "browser-use"
@@ -821,10 +1070,14 @@ def prompt_enable_tool_gateway(
     *,
     force_fresh: bool = True,
 ) -> set[str]:
-    """If eligible tools exist, prompt the user to enable the Tool Gateway.
+    """If eligible tools exist, prompt the user (per tool) to enable the Tool
+    Gateway.
 
-    Uses prompt_choice() with a description parameter so the curses TUI
-    shows the tool context alongside the choices.
+    "Pool enabled" is the trigger: a user with a live free tool pool (or paid
+    access) is shown a per-tool checklist of the covered managed backends and
+    picks which to route through the gateway. The free pool funds web/image/
+    tts/browser but not video, so the checklist only lists covered tools (the
+    coverage filter lives in get_gateway_eligible_tools).
 
     Returns the set of tools that were enabled, or empty set if the user
     declined or no tools were eligible.
@@ -837,93 +1090,60 @@ def prompt_enable_tool_gateway(
         return set()
 
     try:
-        from hermes_cli.setup import prompt_choice
+        from hermes_cli.setup import prompt_checklist
     except Exception:
         return set()
 
-    # Build description lines showing full status of all gateway tools
-    desc_parts: list[str] = [
-        "",
-        "  The Tool Gateway gives you access to web search, image generation,",
-        "  text-to-speech, and browser automation through your Nous subscription.",
-        "  No need to sign up for separate API keys — just pick the tools you want.",
-        "",
+    # Frame the offer by entitlement: a $0 free-tool-pool user is not on a paid
+    # plan, so don't call it "your subscription".
+    try:
+        account_info = get_nous_portal_account_info(force_fresh=False)
+    except Exception:
+        account_info = None
+    pool_only = bool(
+        account_info
+        and account_info.paid_service_access is not True
+        and account_info.tool_access is not None
+        and account_info.tool_access.enabled
+    )
+    source_label = "free tool pool" if pool_only else "Nous subscription"
+
+    # Per-tool checklist: unconfigured tools first (pre-checked for new users),
+    # then tools where the user already has their own key (left unchecked so we
+    # don't override their own setup unless they ask).
+    offer_keys: list[str] = list(unconfigured) + list(has_direct)
+    labels: list[str] = [_GATEWAY_TOOL_LABELS[k] for k in unconfigured]
+    labels += [
+        f"{_GATEWAY_TOOL_LABELS[k]} — keep using your {_GATEWAY_DIRECT_LABELS[k]}"
+        for k in has_direct
     ]
-    if already_managed:
-        for k in already_managed:
-            desc_parts.append(f"  ✓ {_GATEWAY_TOOL_LABELS[k]} — using Tool Gateway")
-    if unconfigured:
-        for k in unconfigured:
-            desc_parts.append(f"  ○ {_GATEWAY_TOOL_LABELS[k]} — not configured")
-    if has_direct:
-        for k in has_direct:
-            desc_parts.append(f"  ○ {_GATEWAY_TOOL_LABELS[k]} — using {_GATEWAY_DIRECT_LABELS[k]}")
+    pre_selected = list(range(len(unconfigured)))
 
-    # Build short choice labels — detail is in the description above
-    choices: list[str] = []
-    choice_keys: list[str] = []  # maps choice index -> action
-
-    if unconfigured and has_direct:
-        choices.append("Enable for all tools (existing keys kept, not used)")
-        choice_keys.append("all")
-
-        choices.append("Enable only for tools without existing keys")
-        choice_keys.append("unconfigured")
-
-        choices.append("Skip")
-        choice_keys.append("skip")
-
-    elif unconfigured:
-        choices.append("Enable Tool Gateway")
-        choice_keys.append("unconfigured")
-
-        choices.append("Skip")
-        choice_keys.append("skip")
-
+    if pool_only:
+        title = "Your free Nous tool pool — pick the tools to enable:"
     else:
-        choices.append("Enable Tool Gateway (existing keys kept, not used)")
-        choice_keys.append("all")
-
-        choices.append("Skip")
-        choice_keys.append("skip")
-
-    description = "\n".join(desc_parts) if desc_parts else None
-    # Default to "Enable" when user has no direct keys (new user),
-    # default to "Skip" when they have existing keys to preserve.
-    default_idx = 0 if not has_direct else len(choices) - 1
+        title = (
+            "Your Nous subscription includes the Tool Gateway — "
+            "pick the tools to enable:"
+        )
 
     try:
-        idx = prompt_choice(
-            "Your Nous subscription includes the Tool Gateway.",
-            choices,
-            default_idx,
-            description=description,
-        )
+        chosen_idx = prompt_checklist(title, labels, pre_selected)
     except (KeyboardInterrupt, EOFError, OSError, SystemExit):
         return set()
 
-    action = choice_keys[idx]
-    if action == "skip":
+    chosen_keys = [offer_keys[i] for i in chosen_idx if 0 <= i < len(offer_keys)]
+    if not chosen_keys:
         return set()
 
-    if action == "all":
-        # Apply to switchable tools + ensure already-managed tools also
-        # have use_gateway persisted in config for consistency.
-        to_apply = list(_ALL_GATEWAY_KEYS)
-    else:
-        to_apply = unconfigured
-
-    changed = apply_gateway_defaults(config, to_apply)
+    changed = apply_gateway_defaults(config, chosen_keys)
     if changed:
         from hermes_cli.config import save_config
+
         save_config(config)
-        # Only report the tools that actually switched (not already-managed ones)
-        newly_switched = changed - set(already_managed)
-        for key in sorted(newly_switched):
+        for key in sorted(changed):
             label = _GATEWAY_TOOL_LABELS.get(key, key)
-            print(f"  ✓ {label}: enabled via Nous subscription")
-        if already_managed and not newly_switched:
-            print("  (all tools already using Tool Gateway)")
+            print(f"  ✓ {label}: enabled via {source_label}")
     return changed
 
 
@@ -932,8 +1152,13 @@ def prompt_enable_tool_gateway(
 # ---------------------------------------------------------------------------
 
 
-def ensure_nous_portal_access(*, capability: str = "the Nous Tool Gateway") -> bool:
-    """Make sure the user has paid Nous Portal access, logging in if needed.
+def ensure_nous_portal_access(
+    *,
+    capability: str = "the Nous Tool Gateway",
+    coverage_category: Optional[str] = None,
+) -> bool:
+    """Make sure the user is entitled to the Nous Tool Gateway, logging in if
+    needed.
 
     Used by ``hermes tools`` when a user selects a Nous-managed Tool Gateway
     backend (e.g. "Firecrawl (Nous Portal)").  Unlike ``hermes model``'s Nous
@@ -947,15 +1172,28 @@ def ensure_nous_portal_access(*, capability: str = "the Nous Tool Gateway") -> b
     already logged in) and refreshes entitlement, so the caller can enable the
     single tool the user picked.
 
-    Returns ``True`` when the account has paid service access after the flow,
-    ``False`` otherwise (declined login, login failed, or no paid entitlement).
+    Entitlement is satisfied by paid service access OR a live free tool pool.
+    When ``coverage_category`` is given (e.g. ``"fal"`` for image gen), the pool
+    must cover that category specifically — so a pool user selecting video
+    (``"fal-video"``, not pool-funded) is correctly denied.
+
+    Returns ``True`` when the account is entitled after the flow, ``False``
+    otherwise (declined login, login failed, or no entitlement).
     """
+
+    def _entitled(account) -> bool:
+        if account is None:
+            return False
+        if coverage_category is not None:
+            return account.tool_gateway_entitled_for(coverage_category)
+        return account.tool_gateway_entitled
+
     # Fast path: already entitled.
     try:
         info = get_nous_portal_account_info(force_fresh=True)
     except Exception:
         info = None
-    if info is not None and info.paid_service_access is True:
+    if _entitled(info):
         return True
 
     # If not logged in at all, run the device-code login (auth only).
@@ -967,11 +1205,15 @@ def ensure_nous_portal_access(*, capability: str = "the Nous Tool Gateway") -> b
         except Exception:
             info = None
 
-    if info is not None and info.paid_service_access is True:
+    if _entitled(info):
         return True
 
-    # Logged in but no paid access — surface billing guidance, do not enable.
-    message = format_nous_portal_entitlement_message(info, capability=capability)
+    # Logged in but not entitled for this capability — surface neutral billing
+    # guidance, do not enable. coverage_category keeps a pool user who lacks this
+    # one category from being told their credits are exhausted.
+    message = format_nous_portal_entitlement_message(
+        info, capability=capability, coverage_category=coverage_category
+    )
     if message:
         for line in message.splitlines():
             print(f"  {line}")

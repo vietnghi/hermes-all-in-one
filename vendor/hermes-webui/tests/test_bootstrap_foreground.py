@@ -92,6 +92,11 @@ def clean_env(monkeypatch):
         "HERMES_WEBUI_HOST",
         "HERMES_WEBUI_PORT",
         "HERMES_WEBUI_AGENT_DIR",
+        "HERMES_WEBUI_PYTHON",
+        "HERMES_WEBUI_DISABLE_LOCAL_VENV",
+        "HERMES_WEBUI_STATE_DIR",
+        "HERMES_WEBUI_SERVER_CWD",
+        "HERMES_HOME",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -231,10 +236,11 @@ class TestMainForegroundRouting:
     def stub_main_dependencies(self, monkeypatch, tmp_path):
         """Stub out everything main() calls except the routing decision."""
         import bootstrap as bs
+        python_exe = sys.executable
         monkeypatch.setattr(bs, "ensure_supported_platform", lambda: None)
         monkeypatch.setattr(bs, "discover_agent_dir", lambda: tmp_path / "agent")
         monkeypatch.setattr(bs, "hermes_command_exists", lambda: True)
-        monkeypatch.setattr(bs, "discover_launcher_python", lambda *a: "/usr/bin/python3")
+        monkeypatch.setattr(bs, "discover_launcher_python", lambda *a: python_exe)
         monkeypatch.setattr(bs, "ensure_python_has_webui_deps", lambda *a, **kw: a[0])
         monkeypatch.setattr(bs, "wait_for_health", lambda *a, **kw: True)
         monkeypatch.setattr(bs, "open_browser", lambda *a, **kw: None)
@@ -265,6 +271,7 @@ class TestMainForegroundRouting:
     def test_foreground_flag_uses_execv(self, stub_main_dependencies, clean_env, monkeypatch):
         bs = stub_main_dependencies
         monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground"])
+        monkeypatch.setattr(sys, "platform", "linux")
 
         execv_calls = []
         popen_calls = []
@@ -289,9 +296,10 @@ class TestMainForegroundRouting:
         assert len(popen_calls) == 0, "--foreground must NOT call subprocess.Popen"
 
         path, argv = execv_calls[0]
-        assert path == "/usr/bin/python3"
+        python_exe = sys.executable
+        assert path == python_exe
         # argv[0] is the program name (convention), argv[1] is the script
-        assert argv[0] == "/usr/bin/python3"
+        assert argv[0] == python_exe
         assert argv[1].endswith("server.py")
 
     @pytest.mark.parametrize("var", [
@@ -304,6 +312,7 @@ class TestMainForegroundRouting:
     def test_supervisor_env_var_auto_promotes_to_execv(self, stub_main_dependencies, clean_env, monkeypatch, var):
         bs = stub_main_dependencies
         monkeypatch.setattr(sys, "argv", ["bootstrap.py"])  # no --foreground
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setenv(var, "deadbeef")
 
         execv_calls = []
@@ -327,6 +336,7 @@ class TestMainForegroundRouting:
     def test_explicit_opt_in_env_auto_promotes_to_execv(self, stub_main_dependencies, clean_env, monkeypatch):
         bs = stub_main_dependencies
         monkeypatch.setattr(sys, "argv", ["bootstrap.py"])  # no --foreground flag
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setenv("HERMES_WEBUI_FOREGROUND", "1")
 
         execv_calls = []
@@ -341,6 +351,27 @@ class TestMainForegroundRouting:
             bs.main()
         assert len(execv_calls) == 1
 
+    def test_foreground_defaults_state_dir_to_hermes_home_webui(self, stub_main_dependencies, clean_env, monkeypatch, tmp_path):
+        bs = stub_main_dependencies
+        hermes_home = tmp_path / ".hermes" / "profiles" / "webui"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("HERMES_WEBUI_STATE_DIR", raising=False)
+        monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground"])
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(os, "chdir", lambda p: None)
+        monkeypatch.setattr(os, "access", lambda path, mode: True)
+
+        def fake_execv(*_args):
+            raise SystemExit(0)
+
+        monkeypatch.setattr(os, "execv", fake_execv)
+
+        with pytest.raises(SystemExit):
+            bs.main()
+
+        assert os.environ["HERMES_WEBUI_STATE_DIR"] == str(hermes_home / "webui")
+
 
 class TestForegroundEnvAndCwd:
     """The post-execv server.py inherits os.environ and cwd from us."""
@@ -348,12 +379,13 @@ class TestForegroundEnvAndCwd:
     @pytest.fixture
     def setup(self, monkeypatch, tmp_path):
         import bootstrap as bs
+        python_exe = sys.executable
         monkeypatch.setattr(bs, "ensure_supported_platform", lambda: None)
         agent_dir = tmp_path / "agent"
         agent_dir.mkdir()
         monkeypatch.setattr(bs, "discover_agent_dir", lambda: agent_dir)
         monkeypatch.setattr(bs, "hermes_command_exists", lambda: True)
-        monkeypatch.setattr(bs, "discover_launcher_python", lambda *a: "/usr/bin/python3")
+        monkeypatch.setattr(bs, "discover_launcher_python", lambda *a: python_exe)
         monkeypatch.setattr(bs, "ensure_python_has_webui_deps", lambda *a, **kw: a[0])
         monkeypatch.setattr(bs, "wait_for_health", lambda *a, **kw: True)
         monkeypatch.setattr(bs, "open_browser", lambda *a, **kw: None)
@@ -364,6 +396,7 @@ class TestForegroundEnvAndCwd:
     def test_foreground_chdirs_to_agent_dir_before_exec(self, setup, monkeypatch, clean_env):
         bs, agent_dir = setup
         monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground", "--host", "127.0.0.1", "9999"])
+        monkeypatch.setattr(sys, "platform", "linux")
 
         chdir_calls = []
         monkeypatch.setattr(os, "chdir", lambda p: chdir_calls.append(p))
@@ -377,11 +410,55 @@ class TestForegroundEnvAndCwd:
         assert len(chdir_calls) == 1
         assert chdir_calls[0] == str(agent_dir)
 
+    def test_foreground_chdirs_to_server_cwd_override_before_launch(self, setup, monkeypatch, clean_env, tmp_path):
+        bs, _agent_dir = setup
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_WEBUI_SERVER_CWD", str(workspace))
+        monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground"])
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        chdir_calls = []
+        monkeypatch.setattr(os, "chdir", lambda p: chdir_calls.append(p))
+
+        def fake_execv(*_args):
+            raise SystemExit(0)
+
+        monkeypatch.setattr(os, "execv", fake_execv)
+
+        with pytest.raises(SystemExit):
+            bs.main()
+
+        assert chdir_calls == [str(workspace)]
+
+    def test_windows_foreground_popen_uses_server_cwd_override(self, setup, monkeypatch, clean_env, tmp_path):
+        bs, _agent_dir = setup
+        workspace = tmp_path / "workspace-win"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_WEBUI_SERVER_CWD", str(workspace))
+        monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground"])
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(os, "chdir", lambda p: None)
+
+        popen_calls = []
+
+        def fake_popen(*args, **kwargs):
+            popen_calls.append((args, kwargs))
+            return None
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+        with pytest.raises(SystemExit):
+            bs.main()
+
+        assert popen_calls[0][1]["cwd"] == str(workspace)
+
     def test_foreground_exports_resolved_env_vars(self, setup, monkeypatch, clean_env):
         bs, agent_dir = setup
         monkeypatch.setattr(sys, "argv", [
             "bootstrap.py", "--foreground", "--host", "0.0.0.0", "9119"
         ])
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(os, "chdir", lambda p: None)
 
         def fake_execv(*a):
@@ -402,6 +479,7 @@ class TestForegroundEnvAndCwd:
     def test_foreground_does_not_call_wait_for_health(self, setup, monkeypatch, clean_env):
         bs, _ = setup
         monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground"])
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(os, "chdir", lambda p: None)
 
         wait_calls = []
@@ -444,12 +522,74 @@ class TestForegroundExecutabilityGuard:
     def test_non_executable_python_raises_runtime_error(self, setup_with_bad_python, monkeypatch, clean_env):
         bs = setup_with_bad_python
         monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground"])
+        monkeypatch.setattr(sys, "platform", "linux")
 
         execv_calls = []
         monkeypatch.setattr(os, "execv", lambda *a: execv_calls.append(a))
+        monkeypatch.setattr(os, "access", lambda path, mode: False)
         monkeypatch.setattr(os, "chdir", lambda p: None)
 
         with pytest.raises(RuntimeError, match="not executable"):
             bs.main()
         # execv must NOT have been called when the guard fires
         assert len(execv_calls) == 0
+
+
+def test_package_python_discovers_agent_before_skip_install_gate(import_bootstrap, clean_env, monkeypatch, tmp_path):
+    bs = import_bootstrap
+    agent_dir = tmp_path / "site-packages"
+    agent_dir.mkdir()
+    (agent_dir / "run_agent.py").write_text("class AIAgent:\n    pass\n", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    python_exe = sys.executable
+    execv_calls = []
+
+    monkeypatch.setenv("HERMES_WEBUI_PYTHON", python_exe)
+    monkeypatch.setenv("HERMES_WEBUI_DISABLE_LOCAL_VENV", "1")
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("PYTHONPATH", str(agent_dir))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(bs, "REPO_ROOT", tmp_path / "webui")
+    monkeypatch.setattr(bs.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(bs, "ensure_supported_platform", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground", "--skip-agent-install"])
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "access", lambda path, mode: True)
+    monkeypatch.setattr(os, "chdir", lambda path: None)
+
+    def fake_execv(path, argv):
+        execv_calls.append((path, argv))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(os, "execv", fake_execv)
+
+    with patch.object(bs, "install_hermes_agent") as mock_install, patch.object(bs.venv, "EnvBuilder") as mock_builder, pytest.raises(SystemExit):
+        bs.main()
+
+    assert execv_calls == [(python_exe, [python_exe, str(bs.REPO_ROOT / "server.py")])]
+    assert os.environ["HERMES_WEBUI_AGENT_DIR"] == str(agent_dir.resolve())
+    mock_install.assert_not_called()
+    mock_builder.assert_not_called()
+
+
+def test_package_python_without_agent_stays_fail_closed(import_bootstrap, clean_env, monkeypatch, tmp_path):
+    bs = import_bootstrap
+    python_exe = sys.executable
+
+    monkeypatch.setenv("HERMES_WEBUI_PYTHON", python_exe)
+    monkeypatch.setenv("HERMES_WEBUI_DISABLE_LOCAL_VENV", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(bs, "REPO_ROOT", tmp_path / "webui")
+    monkeypatch.setattr(bs.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(bs, "ensure_supported_platform", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground", "--skip-agent-install"])
+
+    with patch.object(bs, "_agent_dir_from_python", return_value=None) as mock_probe, patch.object(bs, "install_hermes_agent") as mock_install, patch.object(bs.venv, "EnvBuilder") as mock_builder, patch.object(os, "execv") as mock_execv, pytest.raises(RuntimeError, match="Hermes Agent was not found"):
+        bs.main()
+
+    mock_probe.assert_called_once_with(python_exe)
+    mock_install.assert_not_called()
+    mock_builder.assert_not_called()
+    mock_execv.assert_not_called()

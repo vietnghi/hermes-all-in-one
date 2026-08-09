@@ -14,6 +14,10 @@ WEBUI_REMOTE_URL="https://github.com/nesquena/hermes-webui"
 WEBUI_REMOTE_REF="master"
 WEBUI_PREFIX="vendor/hermes-webui"
 
+# Resolve the real git dir. In a worktree ".git" is a file, not a directory,
+# and MERGE_HEAD lives under .git/worktrees/<name>/ instead.
+GIT_DIR="$(git rev-parse --git-dir)"
+
 run() {
   echo "+ $*"
   "$@"
@@ -46,8 +50,24 @@ ensure_remote() {
   fi
 }
 
+# Resolve every conflicted path under a prefix in favour of upstream, covering
+# modify/modify (UU), modify/delete (UD) and delete/modify (DU) conflicts.
+take_upstream() {
+  local prefix="$1"
+  local status path
+  while IFS= read -r line; do
+    status="${line:0:2}"
+    path="${line:3}"
+    case "$status" in
+      UD) git rm -q -- "$path" ;;              # upstream deleted it
+      DU) git add -- "$path" ;;                # upstream still has it
+      *)  git checkout --theirs -- "$path" && git add -- "$path" ;;
+    esac
+  done < <(git status --porcelain -- "$prefix" | grep -E '^(DD|AU|UD|UA|DU|AA|UU) ' || true)
+}
+
 # Abort any incomplete subtree merge left by a previous failed run.
-if [[ -f ".git/MERGE_HEAD" ]]; then
+if [[ -f "${GIT_DIR}/MERGE_HEAD" ]]; then
   echo "[sync] incomplete merge detected — aborting before retry"
   git merge --abort
 fi
@@ -62,10 +82,9 @@ run git fetch "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF"
 # If the pull conflicts (e.g. because a local patch was committed directly into the
 # vendor tree, breaking the subtree merge base), accept all upstream files and commit.
 run git subtree pull --prefix="$AGENT_PREFIX" "$AGENT_REMOTE_NAME" "$AGENT_REMOTE_REF" --squash || {
-  if [[ -f ".git/MERGE_HEAD" ]]; then
+  if [[ -f "${GIT_DIR}/MERGE_HEAD" ]]; then
     echo "[sync] subtree conflict — accepting all upstream vendor/hermes-agent files"
-    git checkout --theirs -- "$AGENT_PREFIX/"
-    git add "$AGENT_PREFIX/"
+    take_upstream "$AGENT_PREFIX/"
     git commit --no-edit
   else
     exit 1
