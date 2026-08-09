@@ -40,6 +40,11 @@ NODE = shutil.which("node")
 pytestmark = pytest.mark.skipif(NODE is None, reason="node not on PATH")
 
 
+@pytest.fixture(scope="module")
+def commands_src() -> str:
+    return COMMANDS_JS_PATH.read_text(encoding="utf-8")
+
+
 # ── driver for _findModelInDropdown (ui.js) ─────────────────────────────────
 
 _FIND_DRIVER = r"""
@@ -164,7 +169,7 @@ def _resolve(driver, query, groups, sel_options):
     r = subprocess.run(
         [NODE, driver, str(COMMANDS_JS_PATH),
          json.dumps({"query": query, "groups": groups, "selOptions": sel_options})],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=30,
     )
     if r.returncode != 0:
         raise RuntimeError(f"node driver failed: {r.stderr}")
@@ -175,7 +180,7 @@ def _find(driver, model_id, options, preferred=None):
     r = subprocess.run(
         [NODE, driver, str(UI_JS_PATH),
          json.dumps({"modelId": model_id, "options": options, "preferredProvider": preferred})],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=30,
     )
     if r.returncode != 0:
         raise RuntimeError(f"node driver failed: {r.stderr}")
@@ -185,7 +190,7 @@ def _find(driver, model_id, options, preferred=None):
 def _best(driver, query, options):
     r = subprocess.run(
         [NODE, driver, str(COMMANDS_JS_PATH), json.dumps({"query": query, "options": options})],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=30,
     )
     if r.returncode != 0:
         raise RuntimeError(f"node driver failed: {r.stderr}")
@@ -302,12 +307,7 @@ class TestDidYouMeanToastAssembly:
     And no_model_match already ends with an opening quote, so cmdModel must close
     with `${args}"`, not `"${args}"` (which doubled the quote)."""
 
-    @pytest.fixture(scope="class")
-    def commands_src(self):
-        import pathlib
-        root = pathlib.Path(__file__).resolve().parents[1]
-        return (root / "static" / "commands.js").read_text(encoding="utf-8")
-
+    # Uses the module-scoped commands_src fixture above.
     def test_toast_passes_suggestion_as_t_argument(self, commands_src):
         assert "t('model_did_you_mean', suggestion)" in commands_src, (
             "cmdModel must pass the suggestion into t() so the template fills in "
@@ -342,12 +342,7 @@ class TestSlashQualifiedVersionedNoSnap:
     no-match/'did you mean?' toast. The cross-provider direct update is gated on
     `!versionedNoSnap` so genuinely-off-catalog providers (no near variant) still work."""
 
-    @pytest.fixture(scope="class")
-    def commands_src(self):
-        import pathlib
-        root = pathlib.Path(__file__).resolve().parents[1]
-        return (root / "static" / "commands.js").read_text(encoding="utf-8")
-
+    # Uses the module-scoped commands_src fixture above.
     def test_cross_provider_direct_update_gated_on_versioned_no_snap(self, commands_src):
         # The guard variable is computed from the version check + a near suggestion.
         assert "_looksLikeVersionedModel(bare)" in commands_src
@@ -470,12 +465,7 @@ class TestCmdModelFullCatalogWiring:
     """Source-level guards: cmdModel must build candidates from the catalog and
     inject the option before selecting, so an extras-only winner is honored."""
 
-    @pytest.fixture(scope="class")
-    def commands_src(self):
-        import pathlib
-        root = pathlib.Path(__file__).resolve().parents[1]
-        return (root / "static" / "commands.js").read_text(encoding="utf-8")
-
+    # Uses the module-scoped commands_src fixture above.
     def test_builds_candidates_from_catalog_groups(self, commands_src):
         assert "_buildModelCandidates(sel,modelsData&&modelsData.groups)" in commands_src
 

@@ -120,7 +120,7 @@ def test_audit_reports_runtime_agent_execution_imports():
     classes = _class_by_id(_run_audit())
     anchors = _anchors(classes["runtime_agent_execution"])
 
-    assert ("api/streaming.py", "run_agent") in anchors
+    assert ("api/agent_runtime.py", "run_agent") in anchors
     assert ("api/routes.py", "tools.skills_tool") in anchors
     assert ("api/streaming.py", "tools.approval") in anchors
     assert ("api/routes.py", "cron.jobs") in anchors
@@ -145,8 +145,15 @@ def test_audit_embedded_worker_import_line_anchors_are_source_lines():
         if finding["path"] == "api/providers.py" and finding["anchor"] == "agent.account_usage"
     )
 
-    assert account_usage["line"] == 168
-    assert account_usage["text"] == "from agent.account_usage import fetch_account_usage"
+    expected_text = "from agent.account_usage import fetch_account_usage"
+    assert account_usage["text"] == expected_text
+    # The reported line number must be an ACCURATE source anchor — i.e. that line
+    # in the real file actually contains the import. Asserting the exact number is
+    # brittle (any edit above it shifts it); asserting the line CONTENT at the
+    # reported line is the real invariant ("line anchors are source lines").
+    source_lines = (REPO / account_usage["path"]).read_text(encoding="utf-8").splitlines()
+    assert account_usage["line"] >= 1
+    assert source_lines[account_usage["line"] - 1].strip() == expected_text
 
 
 def test_audit_reports_runtime_state_and_provider_imports():

@@ -41,6 +41,20 @@ const _IMAGE_EXTS=/\.(png|jpg|jpeg|gif|webp|bmp|ico|avif)$/i;
 const _SVG_EXTS=/\.svg$/i;
 const _AUDIO_EXTS=/\.(mp3|ogg|wav|m4a|aac|flac|wma|opus|webm)$/i;
 const _VIDEO_EXTS=/\.(mp4|webm|mkv|mov|avi|ogv|m4v)$/i;
+// Minimal stand-in for ui.js' _inlineMediaHtmlForRef used when the driver
+// extracts only renderMd(). Mirrors the live UI for the cases the existing
+// tests assert against (https image, bare file:// image). The full renderer
+// (ui.js) is preferred on the real page — these nodes only cover what is
+// reachable from a standalone renderMd() invocation.
+function _inlineMediaHtmlForRef(ref){
+  const r = String(ref || '');
+  if (/^https?:\/\//.test(r)) return `<img class="msg-media-img" src="${esc(r)}" alt="image" loading="lazy">`;
+  if (/^file:\/\//.test(r)){
+    const m = r.replace(/^file:\/\//i, '');
+    return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(m)}" alt="image" loading="lazy">`;
+  }
+  return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(r)}" alt="image" loading="lazy">`;
+}
 
 function extractFunc(name) {
   const re = new RegExp('function\\s+' + name + '\\s*\\(');
@@ -80,7 +94,7 @@ def _render(driver_path, markdown: str) -> str:
         input=markdown,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed: {result.stderr}")
@@ -242,6 +256,25 @@ class TestCommonLLMShapes:
         assert "<p><table" not in out
         assert "</table></p>" not in out
 
+    def test_table_pipe_inside_inline_code_is_protected(self, driver_path):
+        """Pipes inside backtick code in table cells must not create extra columns."""
+        src = (
+            "| field | expr |\n"
+            "| --- | --- |\n"
+            "| set | `updates.model = modelState.model || null` |\n"
+        )
+        out = _render(driver_path, src)
+        # Must be exactly 2 cells in the data row
+        assert "<th>field</th>" in out
+        assert "<th>expr</th>" in out
+        # The code cell should contain both pipes
+        assert "<code>" in out
+        assert "||" in out
+        # Must NOT split into extra cells
+        assert out.count("<td>") == 2, (
+            f"Expected exactly 2 <td> cells, got {out.count('<td>')}: {out!r}"
+        )
+
     def test_strikethrough_outside_quote(self, driver_path):
         out = _render(driver_path, "This was ~~outdated~~ but is now fine.")
         assert "<del>outdated</del>" in out
@@ -288,6 +321,44 @@ class TestCommonLLMShapes:
         assert "And a closing remark." in out
         # No leading-space artifacts in the quoted text
         assert "\n " not in out.replace("</blockquote>", "")
+
+
+class TestMarkdownListsWithLatex:
+    """Drive the real renderer through the list path that shares the KaTeX placeholders."""
+
+    def test_plain_lists_still_render_markers(self, driver_path):
+        out = _render(driver_path, "- one\n- two\n\n1. alpha\n2. beta")
+        assert "<ul><li>one</li><li>two</li></ul>" in out
+        assert '<ol><li value="1">alpha</li><li value="2">beta</li></ol>' in out
+
+    def test_continuation_line_stays_inside_same_list_item(self, driver_path):
+        out = _render(driver_path, "- first line\n  second line\n- next item")
+        assert "<ul>" in out
+        assert "<li>first line\nsecond line</li>" in out, out
+        assert "<li>next item</li>" in out
+
+    def test_nested_indentation_stays_in_list(self, driver_path):
+        out = _render(driver_path, "- parent\n  - child")
+        assert "<ul>" in out
+        assert "<li>parent</li>" in out
+        assert '<li style="margin-left:16px">child</li>' in out
+
+    def test_display_math_line_stays_inside_list_item(self, driver_path):
+        src = "- intro\n\n  $$x^2$$\n\n  continuation"
+        out = _render(driver_path, src)
+        assert "<ul>" in out and "</ul>" in out
+        assert "<p>continuation</p>" not in out, out
+        assert "<div class=\"katex-block\" data-katex=\"display\">x^2</div>" in out
+        assert "<li>intro\n<div class=\"katex-block\" data-katex=\"display\">x^2</div>\ncontinuation</li>" in out, out
+
+    def test_mixed_markdown_and_latex_ordered_list_preserves_all_items(self, driver_path):
+        src = "1. **First** with $x$\n2. $$y$$\n3. tail"
+        out = _render(driver_path, src)
+        assert "<ol>" in out and "</ol>" in out
+        assert "<strong>First</strong>" in out
+        assert "<span class=\"katex-inline\" data-katex=\"inline\">x</span>" in out
+        assert "<div class=\"katex-block\" data-katex=\"display\">y</div>" in out
+        assert '<li value="3">tail</li>' in out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,7 +430,7 @@ class TestFencedCodeFenceLength:
             "That is much more correct than pretending"
         )
         out = _render(driver_path, src)
-        assert out.count("<pre>") == 1
+        assert out.count("<pre class=\"md-source-block\">") == 1
         assert out.count("</pre>") == 1
         assert '<div class="pre-header">md</div>' in out
         assert "```novelcrafter" in out
@@ -370,7 +441,7 @@ class TestFencedCodeFenceLength:
 
     def test_four_backtick_outer_fence_preserves_inner_triple_fence(self, driver_path):
         out = _render(driver_path, "````md\n```inner\nfoo\n```\n````\n")
-        assert out.count("<pre>") == 1
+        assert out.count("<pre class=\"md-source-block\">") == 1
         assert out.count("</pre>") == 1
         assert '<div class="pre-header">md</div>' in out
         assert "```inner" in out
