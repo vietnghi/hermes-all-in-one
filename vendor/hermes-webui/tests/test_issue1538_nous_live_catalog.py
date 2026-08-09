@@ -129,6 +129,12 @@ def _scrub_provider_env(monkeypatch):
         "XIAOMI_API_KEY",
         "OPENCODE_ZEN_API_KEY", "OPENCODE_GO_API_KEY",
         "NOUS_API_KEY", "NVIDIA_API_KEY", "LM_API_KEY", "LMSTUDIO_API_KEY",
+        # Model-selection overrides: get_effective_default_model() treats these
+        # as the highest-priority default-model source, above config. A runner
+        # that exports HERMES_MODEL (e.g. a live agent session set to "opus-4.8")
+        # injects that id into the picker/catalog and breaks the @nous: prefix
+        # invariant below. Scrub so detection sees only the installed stubs.
+        "HERMES_MODEL", "OPENAI_MODEL", "LLM_MODEL",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -243,10 +249,23 @@ class TestNousStaticFallback:
                 "branch should fall back to the curated static list."
             )
             models = nous_groups[0]["models"]
-            assert len(models) == 4, (
-                f"Static fallback should expose exactly the four curated entries "
-                f"in _PROVIDER_MODELS['nous']. Got {len(models)}: "
-                f"{[m['id'] for m in models]}"
+            # The seeder enriches nous with models from hermes_cli at import
+            # time, so the list may have more than the 4 curated entries.
+            # Assert the original curated IDs are present as a subset, and
+            # every ID still carries the @nous: prefix invariant.
+            _curated_ids = {
+                "@nous:anthropic/claude-opus-4.6",
+                "@nous:anthropic/claude-sonnet-4.6",
+                "@nous:openai/gpt-5.4-mini",
+                "@nous:google/gemini-3.1-pro-preview",
+            }
+            _actual_ids = {m["id"] for m in models}
+            assert _curated_ids.issubset(_actual_ids), (
+                f"Curated nous entries missing. Got: {sorted(_actual_ids)}"
+            )
+            assert len(models) >= 4, (
+                f"Static fallback should expose at least the four curated "
+                f"entries. Got {len(models)}: {sorted(_actual_ids)}"
             )
             for m in models:
                 assert m["id"].startswith("@nous:"), m["id"]

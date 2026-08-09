@@ -16,12 +16,9 @@ def test_boot_call_before_session_load():
     """fetchReasoningChip() should be called before session load in boot sequence."""
     with open("static/boot.js") as f:
         src = f.read()
-    # Find the boot session load; URL-anchored tabs may prefer a URL session id
-    # before falling back to the stored session id.
-    boot_marker = "localStorage.getItem('hermes-webui-session')"
+    boot_marker = "await loadSession(saved, {preserveActiveInput:true});"
     boot_pos = src.index(boot_marker)
-    fetch_pos = src.index("fetchReasoningChip()")
-    # fetchReasoningChip must be called just before the saved session load
+    fetch_pos = src.index("fetchReasoningChip()", src.index("_profileQueryIntentFromLocation"))
     assert fetch_pos < boot_pos, \
         "fetchReasoningChip() should be called before saved session load in boot.js"
 
@@ -45,6 +42,9 @@ def test_reasoning_chip_html_starts_hidden():
         src
     )
     assert m, "composerReasoningWrap must start with style='display:none'"
+    assert 'data-effort="max"' in src, (
+        "composer reasoning dropdown must include Max option"
+    )
 
 
 def test_ui_js_passes_model_context_to_reasoning_api():
@@ -53,7 +53,22 @@ def test_ui_js_passes_model_context_to_reasoning_api():
     assert "_reasoningEffortQuery" in src, (
         "ui.js must pass the active session model/provider to /api/reasoning"
     )
-    assert "api('/api/reasoning'+_reasoningEffortQuery())" in src
+    # The /api/reasoning GET must carry the model/provider query. #4650 captures
+    # the query into a local `key` first (for the in-flight storm + stale-success
+    # guards), so accept either the inlined form or the captured-key form — both
+    # pass _reasoningEffortQuery()'s output to the endpoint.
+    fetch_match = re.search(r"function fetchReasoningChip\([^)]*\)\{(.+?)\n\}", src, re.DOTALL)
+    assert fetch_match, "fetchReasoningChip function must exist"
+    fetch_body = fetch_match.group(1)
+    inlined = "api('/api/reasoning'+_reasoningEffortQuery())" in src
+    captured = (
+        "_reasoningEffortQuery()" in fetch_body
+        and "api('/api/reasoning'+key)" in fetch_body
+    )
+    assert inlined or captured, (
+        "fetchReasoningChip must pass _reasoningEffortQuery() (model/provider context) "
+        "to GET /api/reasoning, either inlined or via a captured key"
+    )
 
 
 def test_fetchReasoningChip_calls_apply():
@@ -61,7 +76,7 @@ def test_fetchReasoningChip_calls_apply():
     with open("static/ui.js") as f:
         src = f.read()
     # Find fetchReasoningChip function
-    func_match = re.search(r"function fetchReasoningChip\(\)\{(.+?)\}", src, re.DOTALL)
+    func_match = re.search(r"function fetchReasoningChip\([^)]*\)\{(.+?)\}", src, re.DOTALL)
     assert func_match, "fetchReasoningChip function must exist"
     func_body = func_match.group(1)
     assert "_applyReasoningChip" in func_body, \
@@ -117,10 +132,13 @@ def test_selectModelFromDropdown_defers_reasoning_sync_to_onchange():
 
 
 def test_model_dropdown_passes_provider_to_select():
-    """Composer model rows must pass provider context into selectModelFromDropdown."""
+    """Composer model rows must pass provider context through the shared picker callback."""
     with open("static/ui.js") as f:
         src = f.read()
+    assert "selectModelFromDropdown(value,provider)" in src, (
+        "composer default picker callback must still route to selectModelFromDropdown"
+    )
     assert re.search(
-        r"selectModelFromDropdown\(m\.value,\s*m\.providerId",
+        r"selectFromDropdown\(m\.value,\s*m\.providerId",
         src,
-    ), "model dropdown rows must pass providerId to selectModelFromDropdown"
+    ), "model dropdown rows must pass providerId through the shared callback"

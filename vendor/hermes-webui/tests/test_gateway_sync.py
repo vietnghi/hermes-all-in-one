@@ -22,15 +22,21 @@ REPO_ROOT = pathlib.Path(__file__).parent.parent.resolve()
 from tests._pytest_port import BASE
 
 
-def get(path):
-    with urllib.request.urlopen(BASE + path, timeout=10) as r:
+def get(path, *, profile=None):
+    headers = {}
+    if profile:
+        headers["Cookie"] = f"hermes_profile={profile}"
+    req = urllib.request.Request(BASE + path, headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read()), r.status
 
 
-def post(path, body=None):
+def post(path, body=None, *, profile=None):
     data = json.dumps(body or {}).encode()
-    req = urllib.request.Request(BASE + path, data=data,
-                                  headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if profile:
+        headers["Cookie"] = f"hermes_profile={profile}"
+    req = urllib.request.Request(BASE + path, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read()), r.status
@@ -48,23 +54,30 @@ def _get_test_state_dir():
     (via os.environ.setdefault) so that tests writing directly to state.db always
     use the same path the test server was started with.  If the env var is not
     set (e.g. when running this file standalone), fall back to the conftest
-    formula: HERMES_HOME/webui-mvp-test.
+    formula via _pytest_port (temp-rooted, never ~/.hermes).
     """
     # Use _pytest_port which applies the same auto-derivation as conftest.py
     from tests._pytest_port import TEST_STATE_DIR as _ptsd
     return _ptsd
 
 
-def _get_state_db_path():
+def _get_profile_state_dir(profile=None):
+    state_dir = _get_test_state_dir()
+    if isinstance(profile, str) and profile.strip():
+        return state_dir / 'profiles' / profile.strip()
+    return state_dir
+
+
+def _get_state_db_path(profile=None):
     """Return path to the test state.db."""
-    return _get_test_state_dir() / 'state.db'
+    return _get_profile_state_dir(profile) / 'state.db'
 
 
-def _ensure_state_db():
+def _ensure_state_db(profile=None):
     """Create state.db with sessions and messages tables if it doesn't exist.
     Returns a connection. Does NOT delete existing data (safe for parallel tests).
     """
-    db_path = _get_state_db_path()
+    db_path = _get_state_db_path(profile)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -274,6 +287,66 @@ def test_webui_state_db_session_without_sidecar_appears_when_agent_sessions_enab
     finally:
         try:
             _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
+        post('/api/settings', {'show_cli_sessions': False})
+
+
+def test_active_cli_state_db_session_with_persisted_user_turn_is_visible_in_cli_bucket():
+    """Active default-title CLI rows with persisted user content stay visible in the CLI bucket."""
+    conn = _ensure_state_db()
+    active_sid = 'cli_active_visible_001'
+    older_sid = 'cli_older_visible_001'
+    ended_sid = 'cli_ended_hidden_001'
+    now = time.time()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions "
+            "(id, source, title, model, started_at, message_count, ended_at, end_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (active_sid, 'cli', 'Untitled', 'openai/gpt-5', now + 20, 0, None, None),
+        )
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (active_sid,))
+        _insert_message(conn, active_sid, 'user', 'Active CLI session still running', now + 21)
+
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions "
+            "(id, source, title, model, started_at, message_count, ended_at, end_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (older_sid, 'cli', 'Named CLI Session', 'openai/gpt-5', now, 1, None, None),
+        )
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (older_sid,))
+        _insert_message(conn, older_sid, 'user', 'Older visible CLI session', now + 1)
+
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions "
+            "(id, source, title, model, started_at, message_count, ended_at, end_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ended_sid, 'cli', 'Untitled', 'openai/gpt-5', now + 10, 1, now + 11, 'cli-close'),
+        )
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (ended_sid,))
+        _insert_message(conn, ended_sid, 'user', 'Ended CLI session', now + 11)
+        conn.commit()
+
+        post('/api/settings', {'show_cli_sessions': True})
+
+        data, status = get('/api/sessions?sidebar_source=cli')
+        assert status == 200
+        sessions = data.get('sessions', [])
+        session_ids = [s.get('session_id') for s in sessions]
+        assert active_sid in session_ids
+        assert older_sid in session_ids
+        assert ended_sid not in session_ids, "ended default-title CLI rows with one user turn stay hidden"
+
+        active = next(s for s in sessions if s.get('session_id') == active_sid)
+        older = next(s for s in sessions if s.get('session_id') == older_sid)
+        assert active.get('message_count') == 1
+        assert active.get('updated_at') > older.get('updated_at')
+        assert session_ids.index(active_sid) < session_ids.index(older_sid)
+    finally:
+        try:
+            _remove_test_sessions(conn, active_sid, older_sid, ended_sid)
             conn.close()
         except Exception:
             pass
@@ -680,7 +753,8 @@ def test_default_title_cli_compression_chain_is_kept_by_lineage():
 
         assert 'cli_default_compress_tip_001' in ids
         assert 'cli_default_compress_root_001' not in ids
-        tip = next(s for s in data.get('sessions', []) if s.get('session_id') == 'cli_default_compress_tip_001')
+        tip = next((s for s in data.get('sessions', []) if s.get('session_id') == 'cli_default_compress_tip_001'), None)
+        assert tip is not None, "compression tip session missing from /api/sessions (test-isolation? check show_cli_sessions + session presence)"
         assert tip.get('_compression_segment_count') == 2
         assert tip.get('_lineage_root_id') == 'cli_default_compress_root_001'
     finally:
@@ -766,7 +840,8 @@ def test_agent_session_limit_applies_after_compression_projection():
         assert chain_ids[-1] in ids
         assert standalone_id in ids
         assert not any(sid in ids for sid in chain_ids[:-1])
-        chain = next(row for row in rows if row.get('id') == chain_ids[-1])
+        chain = next((row for row in rows if row.get('id') == chain_ids[-1]), None)
+        assert chain is not None, "limit-chain tip row missing from projected rows (test-isolation?)"
         assert chain.get('title') == 'Limit Chain #1'
         assert chain.get('_lineage_root_id') == chain_ids[0]
         assert chain.get('_compression_segment_count') == len(chain_ids)
@@ -866,7 +941,8 @@ def test_compression_chain_bubbles_to_top_by_tip_activity():
             f"not the tip's recent value."
         )
 
-        tip_row = next(r for r in rows if r['id'] == 'bubble_tip_001')
+        tip_row = next((r for r in rows if r['id'] == 'bubble_tip_001'), None)
+        assert tip_row is not None, "bubble tip row missing from projected rows (test-isolation?)"
         assert abs(tip_row['last_activity'] - tip_latest_msg) < 0.01, (
             f"Projected tip's last_activity must equal the tip's most recent "
             f"message timestamp ({tip_latest_msg}), not the root's "
@@ -943,7 +1019,9 @@ def test_agent_session_source_normalization_contract():
         'telegram': ('messaging', 'Telegram'),
         'discord': ('messaging', 'Discord'),
         'slack': ('messaging', 'Slack'),
+        'matrix': ('messaging', 'Matrix'),
         'cron': ('cron', 'Cron'),
+        'webhook': ('webhook', 'Webhook'),
         'tool': ('tool', 'Tool'),
         'api_server': ('api', 'API'),
         'something_new': ('other', 'Something New'),
@@ -967,16 +1045,17 @@ def test_sessions_js_treats_email_as_messaging_source():
     raw_section = src[src.find("_MESSAGING_RAW_SOURCES"):src.find("function _isMessagingSession")]
     label_section = src[src.find("_MESSAGING_SOURCE_LABELS"):src.find("function _isMessagingSession")]
 
-    for raw_source in ("email", "wecom", "wecom_callback"):
+    for raw_source in ("email", "wecom", "wecom_callback", "matrix"):
         assert f"'{raw_source}'" in raw_section, f"Missing raw source {raw_source!r} in _MESSAGING_RAW_SOURCES"
 
     assert "email: 'Email'" in label_section
     assert "wecom: 'WeCom'" in label_section
     assert "wecom_callback: 'WeCom Callback'" in label_section
+    assert "matrix: 'Matrix'" in label_section
 
 
-def test_sessions_js_treats_wecom_sidecars_as_messaging_behaviorally():
-    """Stale WeCom sidecars with session_source=other should still route as messaging."""
+def test_sessions_js_treats_messaging_sidecars_behaviorally():
+    """Stale messaging sidecars with session_source=other should still route as messaging."""
     src = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
     start = src.index("const _MESSAGING_RAW_SOURCES")
     end = src.index("/**", start)
@@ -987,6 +1066,7 @@ const cases = [
   {{ session_source: 'other', source: 'wecom' }},
   {{ session_source: 'other', raw_source: 'wecom_callback' }},
   {{ session_source: 'other', source_tag: 'wecom' }},
+  {{ session_source: 'other', source: 'matrix' }},
   {{ session_source: 'messaging', source: 'anything' }},
 ];
 for (const c of cases) {{
@@ -1221,6 +1301,92 @@ def test_import_cli_preserves_messaging_source_metadata(cleanup_test_sessions):
             pass
 
 
+def test_import_cli_named_profile_requires_explicit_all_profiles_opt_in(cleanup_test_sessions):
+    """Unqualified import_cli should not read a named profile's state.db."""
+    named_profile = 'issue1611-import'
+    conn = _ensure_state_db(profile=named_profile)
+    sid = 'gw_named_profile_import_001'
+    cleanup_test_sessions.append(sid)
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source='telegram',
+            title='Named Profile Telegram Session',
+        )
+
+        data, status = post('/api/session/import_cli', {'session_id': sid})
+        assert status == 404, data
+    finally:
+        try:
+            _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
+
+
+def test_import_cli_all_profiles_opt_in_reads_named_profile_state_db(cleanup_test_sessions):
+    """Explicit all-profiles imports should resolve messages from the named profile store."""
+    named_profile = 'issue1611-import'
+    conn = _ensure_state_db(profile=named_profile)
+    sid = 'gw_named_profile_import_001'
+    cleanup_test_sessions.append(sid)
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source='telegram',
+            title='Named Profile Telegram Session',
+        )
+
+        data, status = post('/api/session/import_cli', {
+            'session_id': sid,
+            'all_profiles': True,
+            'profile': named_profile,
+        })
+        assert status == 200, data
+        session = data.get('session', {})
+        messages = session.get('messages', [])
+
+        assert session.get('session_id') == sid
+        assert session.get('profile') == named_profile
+        assert session.get('source_tag') == 'telegram'
+        assert session.get('session_source') == 'messaging'
+        assert [m.get('content') for m in messages] == ['Hello from Telegram', 'Hi there!']
+    finally:
+        try:
+            _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
+
+
+def test_all_profiles_cli_contexts_normalizes_default_profile_name(tmp_path, monkeypatch):
+    from api import models, profiles
+
+    profiles_root = tmp_path / "profiles"
+    profiles_root.mkdir()
+    (profiles_root / "research").mkdir()
+
+    monkeypatch.setattr(profiles, "_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: None)
+    monkeypatch.setattr(
+        profiles,
+        "get_hermes_home_for_profile",
+        lambda profile_name: tmp_path / (profile_name or "default-home"),
+    )
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles_api",
+        lambda: [{"name": None}, {"name": "research"}],
+    )
+
+    contexts, _cache_key = models._all_profiles_cli_contexts()
+
+    assert ("default" in [profile for _home, _db_path, profile in contexts])
+    assert ("research" in [profile for _home, _db_path, profile in contexts])
+
+
 def test_sessions_response_backfills_imported_messaging_source_metadata(cleanup_test_sessions):
     """Old imported messaging sessions should still expose source metadata in /api/sessions."""
     from api.models import Session
@@ -1229,7 +1395,13 @@ def test_sessions_response_backfills_imported_messaging_source_metadata(cleanup_
     sid = 'gw_legacy_import_weixin_001'
     cleanup_test_sessions.append(sid)
     try:
-        _insert_gateway_session(conn, session_id=sid, source='weixin', title='Weixin Session')
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source='weixin',
+            title='Weixin Session',
+            session_key='agent:test:weixin:legacy-import-backfill',
+        )
         s = Session(
             session_id=sid,
             title='Legacy Imported Weixin',
@@ -1242,7 +1414,8 @@ def test_sessions_response_backfills_imported_messaging_source_metadata(cleanup_
 
         data, status = get('/api/sessions')
         assert status == 200
-        session = next(item for item in data.get('sessions', []) if item.get('session_id') == sid)
+        session = next((item for item in data.get('sessions', []) if item.get('session_id') == sid), None)
+        assert session is not None, f"{sid} missing from /api/sessions — show_cli_sessions not applied or session hidden (test-isolation)"
         assert session.get('source_tag') == 'weixin'
         assert session.get('raw_source') == 'weixin'
         assert session.get('session_source') == 'messaging'
@@ -1384,6 +1557,159 @@ def test_sessions_response_distinguishes_same_user_different_chat_identity_from_
             conn.close()
         except Exception:
             pass
+
+
+def test_messaging_projection_keeps_no_identity_continuation_when_gateway_source_active(monkeypatch, cleanup_test_sessions):
+    """A WebUI/mobile recovery continuation must not disappear behind source-wide Gateway hiding.
+
+    Long WebUI turns can rotate to a child session during compression. If the
+    browser is backgrounded before the final SSE handoff, recovery depends on
+    the continuation still being visible in the sidebar. This is source-generic:
+    Telegram, Discord, Slack, and Weixin all use the same messaging projection.
+    """
+    from api import routes
+    from api.models import Session
+
+    parent_sid = "webui_pre_compression_snapshot"
+    cleanup_test_sessions.append(parent_sid)
+    Session(
+        session_id=parent_sid,
+        title="Archived pre-compression snapshot",
+        model="openai/gpt-5",
+        messages=[{"role": "user", "content": "before compression", "timestamp": time.time() - 10}],
+        pre_compression_snapshot=True,
+    ).save(touch_updated_at=False)
+
+    for source in ("telegram", "discord", "slack", "weixin"):
+        active_sid = f"{source}_active_sid"
+        continuation_sid = f"webui_{source}_continuation_no_identity"
+        cleanup_test_sessions.append(continuation_sid)
+        monkeypatch.setattr(
+            routes,
+            "_load_gateway_session_identity_map",
+            lambda source=source, active_sid=active_sid: {
+                active_sid: {
+                    "session_key": f"agent:main:{source}:dm:user_1",
+                    "raw_source": source,
+                    "platform": source,
+                    "chat_type": "dm",
+                    "chat_id": "user_1",
+                    "user_id": "user_1",
+                },
+            },
+        )
+        sessions = [
+            {
+                "session_id": active_sid,
+                "raw_source": source,
+                "session_source": "messaging",
+                "title": f"Current {source} DM",
+                "updated_at": 100,
+                "message_count": 3,
+            },
+            {
+                "session_id": continuation_sid,
+                "raw_source": source,
+                "session_source": "messaging",
+                "chat_id": "webui_recovery_chat",
+                "chat_type": "dm",
+                "title": f"Recovered {source} WebUI continuation",
+                "parent_session_id": parent_sid,
+                "updated_at": 200,
+                "message_count": 1003,
+            },
+        ]
+
+        kept = routes._keep_latest_messaging_session_per_source(sessions)
+        ids = {session.get("session_id") for session in kept}
+
+        assert ids == {active_sid, continuation_sid}
+
+
+def test_session_load_exposes_continuation_for_pre_compression_snapshot(cleanup_test_sessions):
+    """Reloading an old hidden compression snapshot should give the browser a recovery target."""
+    from api.models import Session
+
+    parent_sid = "webui_mobile_snapshot_parent"
+    child_sid = "webui_mobile_snapshot_child"
+    now = time.time()
+    cleanup_test_sessions.extend([parent_sid, child_sid])
+
+    parent = Session(
+        session_id=parent_sid,
+        title="Mobile reload parent",
+        model="openai/gpt-5",
+        messages=[{"role": "user", "content": "before compression", "timestamp": now - 10}],
+        created_at=now - 20,
+        updated_at=now - 10,
+        pre_compression_snapshot=True,
+    )
+    child = Session(
+        session_id=child_sid,
+        title="Mobile reload child",
+        model="openai/gpt-5",
+        parent_session_id=parent_sid,
+        messages=[{"role": "assistant", "content": "finished after reload", "timestamp": now}],
+        created_at=now - 5,
+        updated_at=now,
+    )
+    parent.save(touch_updated_at=False)
+    child.save(touch_updated_at=False)
+
+    data, status = get(f"/api/session?session_id={parent_sid}&messages=0&resolve_model=0")
+
+    assert status == 200
+    assert data["session"].get("session_id") == parent_sid
+    assert data["session"].get("continuation_session_id") == child_sid
+
+
+def test_session_load_exposes_multihop_continuation_for_repeated_compression(cleanup_test_sessions):
+    """A stale older snapshot should recover to the newest visible descendant."""
+    from api.models import Session
+
+    root_sid = "webui_mobile_snapshot_root"
+    middle_sid = "webui_mobile_snapshot_middle"
+    child_sid = "webui_mobile_snapshot_grandchild"
+    now = time.time()
+    cleanup_test_sessions.extend([root_sid, middle_sid, child_sid])
+
+    root = Session(
+        session_id=root_sid,
+        title="Mobile reload root snapshot",
+        model="openai/gpt-5",
+        messages=[{"role": "user", "content": "before first compression", "timestamp": now - 30}],
+        created_at=now - 40,
+        updated_at=now - 30,
+        pre_compression_snapshot=True,
+    )
+    middle = Session(
+        session_id=middle_sid,
+        title="Mobile reload middle snapshot",
+        model="openai/gpt-5",
+        parent_session_id=root_sid,
+        messages=[{"role": "assistant", "content": "before second compression", "timestamp": now - 20}],
+        created_at=now - 25,
+        updated_at=now - 20,
+        pre_compression_snapshot=True,
+    )
+    child = Session(
+        session_id=child_sid,
+        title="Mobile reload final child",
+        model="openai/gpt-5",
+        parent_session_id=middle_sid,
+        messages=[{"role": "assistant", "content": "finished after repeated compression", "timestamp": now}],
+        created_at=now - 5,
+        updated_at=now,
+    )
+    root.save(touch_updated_at=False)
+    middle.save(touch_updated_at=False)
+    child.save(touch_updated_at=False)
+
+    data, status = get(f"/api/session?session_id={root_sid}&messages=0&resolve_model=0")
+
+    assert status == 200
+    assert data["session"].get("session_id") == root_sid
+    assert data["session"].get("continuation_session_id") == child_sid
 
 
 def test_messaging_projection_hides_stale_gateway_internal_segments(monkeypatch):
@@ -1659,12 +1985,59 @@ def test_delete_imported_messaging_session_preserves_agent_memory(cleanup_test_s
             (sid,),
         ).fetchone()[0]
         assert remaining == 2
+
+        # A messaging-session delete deliberately preserves the state.db
+        # transcript (delete_cli_session is skipped), so it must NOT be
+        # recorded in the deleted-WebUI tombstone — otherwise
+        # _claim_or_synthesize_cli_session() would treat the still-live
+        # channel session as was-webui and self-heal it to a 404 on reopen.
+        import api.models as _m
+        assert sid not in _m._load_webui_deleted_session_tombstone(), (
+            "messaging session must not be tombstoned as a deleted WebUI session"
+        )
     finally:
         try:
             _remove_test_sessions(conn, sid)
             conn.close()
         except Exception:
             pass
+
+
+def test_deleted_webui_session_stays_out_of_sidebar_projection(cleanup_test_sessions):
+    """A tombstoned deleted WebUI session must not resurface via the state.db projection.
+
+    Regression for #5498 (second path): even when non-WebUI sessions are shown,
+    _load_cli_sessions_uncached() projects source='webui' state.db rows into the
+    sidebar. Without honoring the deleted-WebUI tombstone, a deleted session
+    reappears as an 'Agent' ghost. The projection must skip a tombstoned
+    source='webui' row that has no live sidecar.
+    """
+    import api.models as _m
+
+    conn = _ensure_state_db()
+    sid = 'webui_deleted_ghost_projection_001'
+    cleanup_test_sessions.append(sid)
+    try:
+        _insert_gateway_session(conn, session_id=sid, source='webui', title='Deleted WebUI Ghost')
+        _m._record_webui_deleted_session_tombstone(sid)
+        # Tombstone should win: ensure no live sidecar exists for this sid.
+        assert not (_m.SESSION_DIR / f'{sid}.json').exists()
+
+        post('/api/settings', {'show_cli_sessions': True})
+        data, status = get('/api/sessions')
+        assert status == 200
+        ids = {s['session_id'] for s in data.get('sessions', [])}
+        assert sid not in ids, (
+            "deleted (tombstoned) WebUI session must not resurface in the sidebar projection"
+        )
+    finally:
+        try:
+            _m._clear_webui_deleted_session_tombstone(sid)
+            _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
+        post('/api/settings', {'show_cli_sessions': False})
 
 
 def test_imported_cron_sessions_hidden_from_sidebar_by_default(cleanup_test_sessions):
@@ -1994,7 +2367,8 @@ def test_sessions_prefers_state_db_metadata_for_messaging_overlap(cleanup_test_s
         post('/api/settings', {'show_cli_sessions': True})
         data, status = get('/api/sessions')
         assert status == 200, data
-        session = next(item for item in data.get('sessions', []) if item.get('session_id') == sid)
+        session = next((item for item in data.get('sessions', []) if item.get('session_id') == sid), None)
+        assert session is not None, f"{sid} missing from /api/sessions (test-isolation)"
         assert session.get('message_count') == len(rows)
         expected_updated = max(ts for _, _, ts in rows)
         assert abs(float(session.get('updated_at') or 0) - expected_updated) < 1.0
@@ -2067,6 +2441,29 @@ def test_importing_older_gateway_session_preserves_original_timestamps_and_order
             {'session_id': newer_webui_sid, 'title': 'Newer WebUI Session'},
         )
         assert rename_status == 200, rename
+        from api.models import Session
+        from tests.conftest import TEST_WORKSPACE
+        newer_webui_session = Session(
+            session_id=newer_webui_sid,
+            title='Newer WebUI Session',
+            workspace=str(TEST_WORKSPACE),
+            model='openai/gpt-5',
+            created_at=newer_webui['session']['created_at'],
+            updated_at=time.time(),
+            profile='default',
+            messages=[{
+                'role': 'user',
+                'content': 'newer visible row',
+                'timestamp': time.time(),
+            }],
+            tool_calls=[],
+        )
+        newer_webui_session.save(touch_updated_at=False)
+        rename_refresh, rename_refresh_status = post(
+            '/api/session/rename',
+            {'session_id': newer_webui_sid, 'title': 'Newer WebUI Session'},
+        )
+        assert rename_refresh_status == 200, rename_refresh
 
         _insert_gateway_session(
             conn,

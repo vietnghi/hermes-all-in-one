@@ -102,7 +102,7 @@ def _install_fake_compression_runtime(monkeypatch, agent_cls):
     )
 
 
-def _make_session(messages=None):
+def _make_session(messages=None, tool_calls=None):
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     messages = messages or [
         {"role": "user", "content": "one"},
@@ -116,6 +116,7 @@ def _make_session(messages=None):
         workspace="/tmp/hermes-webui-test",
         model="openai/gpt-5.4-mini",
         messages=messages,
+        tool_calls=tool_calls or [],
     )
     s.save(touch_updated_at=False)
     return s.session_id
@@ -128,9 +129,197 @@ def test_session_compress_requires_session_id(cleanup_test_sessions):
     assert handler.payload()["error"] == "Missing required field(s): session_id"
 
 
+def test_session_compress_stale_runtime_returns_typed_409_before_mutation(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.routes as routes
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    loaded_before = Session.load(sid)
+    assert loaded_before is not None
+    before = loaded_before.compact()
+    monkeypatch.setattr(
+        routes,
+        "ensure_agent_runtime_current",
+        lambda: (_ for _ in ()).throw(
+            routes.AgentRuntimeChangedError("restart required")
+        ),
+    )
+
+    handler = _FakeHandler()
+    _handle_session_compress(handler, {"session_id": sid})
+
+    assert handler.status == 409
+    assert handler.payload() == {
+        "error": "restart required",
+        "type": "agent_runtime_stale",
+        "retryable": True,
+    }
+    loaded_after = Session.load(sid)
+    assert loaded_after is not None
+    assert loaded_after.compact() == before
+
+
+def test_session_compress_start_stale_runtime_returns_409_before_job_creation(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.routes as routes
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        routes._MANUAL_COMPRESSION_JOBS.pop(sid, None)
+
+    monkeypatch.setattr(
+        routes,
+        "ensure_agent_runtime_current",
+        lambda: (_ for _ in ()).throw(
+            routes.AgentRuntimeChangedError("restart required")
+        ),
+    )
+
+    handler = _FakeHandler()
+    routes._handle_session_compress_start(handler, {"session_id": sid})
+
+    assert handler.status == 409
+    assert json.loads(handler.wfile.getvalue().decode("utf-8")) == {
+        "error": "restart required",
+        "type": "agent_runtime_stale",
+        "retryable": True,
+    }
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        assert sid not in routes._MANUAL_COMPRESSION_JOBS
+
+
+def test_session_compress_start_reuses_running_job_when_runtime_is_stale(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.routes as routes
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    existing = {
+        "session_id": sid,
+        "focus_topic": "already running",
+        "status": "running",
+        "started_at": time.time(),
+        "updated_at": time.time(),
+    }
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        routes._MANUAL_COMPRESSION_JOBS[sid] = existing
+    monkeypatch.setattr(
+        routes,
+        "ensure_agent_runtime_current",
+        lambda: (_ for _ in ()).throw(
+            routes.AgentRuntimeChangedError("restart required")
+        ),
+    )
+
+    handler = _FakeHandler()
+    routes._handle_session_compress_start(handler, {"session_id": sid})
+
+    assert handler.status == 200
+    payload = handler.payload()
+    assert payload["status"] == "running"
+    assert payload["session_id"] == sid
+    assert payload["focus_topic"] == "already running"
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        assert routes._MANUAL_COMPRESSION_JOBS[sid] is existing
+        routes._MANUAL_COMPRESSION_JOBS.pop(sid, None)
+
+
+def test_session_compress_start_rechecks_job_after_runtime_barrier(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.routes as routes
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    admitted = {
+        "session_id": sid,
+        "focus_topic": "admitted concurrently",
+        "status": "running",
+        "started_at": time.time(),
+        "updated_at": time.time(),
+    }
+
+    def barrier_then_admit():
+        with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+            routes._MANUAL_COMPRESSION_JOBS[sid] = admitted
+
+    def reject_duplicate_worker(**_kwargs):
+        raise AssertionError("duplicate worker admitted")
+
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", barrier_then_admit)
+    monkeypatch.setattr(routes.threading, "Thread", reject_duplicate_worker)
+
+    handler = _FakeHandler()
+    routes._handle_session_compress_start(handler, {"session_id": sid})
+
+    assert handler.status == 200
+    assert handler.payload()["status"] == "running"
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        routes._MANUAL_COMPRESSION_JOBS.pop(sid, None)
+
+
+def test_session_compress_worker_preserves_stale_runtime_taxonomy(monkeypatch):
+    import api.routes as routes
+
+    sid = "stale-worker-session"
+    started_at = time.time()
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        routes._MANUAL_COMPRESSION_JOBS[sid] = {
+            "session_id": sid,
+            "status": "running",
+            "started_at": started_at,
+            "updated_at": started_at,
+        }
+
+    monkeypatch.setattr(
+        routes,
+        "_handle_session_compress",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            routes.AgentRuntimeChangedError("restart required")
+        ),
+    )
+
+    routes._run_manual_compression_job(sid, {"session_id": sid})
+
+    handler = _FakeHandler()
+    routes._handle_session_compress_status(handler, sid)
+    payload = handler.payload()
+    assert handler.status == 200
+    assert payload["ok"] is False
+    assert payload["status"] == "error"
+    assert payload["session_id"] == sid
+    assert payload["error"] == "restart required"
+    assert payload["error_status"] == 409
+    assert payload["type"] == "agent_runtime_stale"
+    assert payload["retryable"] is True
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        routes._MANUAL_COMPRESSION_JOBS.pop(sid, None)
+
+
 def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     created = cleanup_test_sessions
-    sid = _make_session()
+    original_messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    compressed_messages = [original_messages[0], original_messages[-1]]
+    settled_tool_calls = [
+        {
+            "id": "call_1",
+            "name": "terminal",
+            "assistant_msg_idx": 1,
+            "done": True,
+            "result": "schema.sql",
+        }
+    ]
+    sid = _make_session(original_messages, tool_calls=settled_tool_calls)
     created.append(sid)
 
     _install_fake_compression_runtime(monkeypatch, _FakeAgent)
@@ -144,18 +333,37 @@ def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     assert payload["focus_topic"] == "database schema"
     assert payload["summary"]["headline"] == "Compressed: 4 → 2 messages"
     assert payload["session"]["session_id"] == sid
-    assert payload["session"]["messages"] == [
-        {"role": "user", "content": "one"},
-        {"role": "assistant", "content": "four"},
-    ]
+    assert payload["session"]["messages"] == original_messages
+    assert payload["session"]["tool_calls"] == settled_tool_calls
+    assert payload["session"]["message_count"] == len(original_messages)
     assert payload["session"]["compression_anchor_summary"] is not None
-    assert payload["session"]["compression_anchor_visible_idx"] == 1
+    assert payload["session"]["compression_anchor_visible_idx"] == 3
     assert isinstance(payload["session"]["compression_anchor_message_key"], dict)
     assert payload["session"]["compression_anchor_message_key"].get("role") == "assistant"
+    assert payload["session"]["compression_anchor_message_key"].get("text") == "four"
     loaded = get_session(sid)
+    persisted = Session.load(sid)
+    assert loaded.messages == original_messages
+    assert [m.get("role") for m in loaded.context_messages] == [m.get("role") for m in compressed_messages]
+    assert [m.get("content") for m in loaded.context_messages] == [m.get("content") for m in compressed_messages]
+    assert loaded.tool_calls == settled_tool_calls
+    assert persisted.messages == original_messages
+    assert [m.get("role") for m in persisted.context_messages] == [m.get("role") for m in compressed_messages]
+    assert [m.get("content") for m in persisted.context_messages] == [m.get("content") for m in compressed_messages]
+    assert persisted.tool_calls == settled_tool_calls
     assert loaded.compression_anchor_summary == payload["session"]["compression_anchor_summary"]
     assert loaded.compression_anchor_visible_idx == payload["session"]["compression_anchor_visible_idx"]
     assert loaded.compression_anchor_message_key == payload["session"]["compression_anchor_message_key"]
+    assert loaded.compression_anchor_mode == "manual"
+    assert loaded.truncation_watermark is not None
+    assert loaded.truncation_boundary == loaded.truncation_watermark
+    assert loaded.last_prompt_tokens is not None
+    assert persisted.compression_anchor_mode == "manual"
+    assert persisted.truncation_watermark == loaded.truncation_watermark
+    assert persisted.truncation_boundary == loaded.truncation_boundary
+    assert not (SESSION_DIR / f"{sid}.json.bak").exists()
+    assert persisted.compression_anchor_visible_idx == 3
+    assert persisted.compression_anchor_message_key == payload["session"]["compression_anchor_message_key"]
     assert _FakeAgent.last_instance is not None
     assert _FakeAgent.last_instance.context_compressor.calls[0]["focus_topic"] == "database schema"
 
@@ -185,7 +393,16 @@ def test_session_compress_start_is_async_and_reuses_running_job(monkeypatch, cle
             self.instances.append(self)
 
     created = cleanup_test_sessions
-    sid = _make_session()
+    settled_tool_calls = [
+        {
+            "id": "call_async_1",
+            "name": "read_file",
+            "assistant_msg_idx": 1,
+            "done": True,
+            "result": "config.yaml",
+        }
+    ]
+    sid = _make_session(tool_calls=settled_tool_calls)
     created.append(sid)
     _install_fake_compression_runtime(monkeypatch, BlockingAgent)
     try:
@@ -227,8 +444,17 @@ def test_session_compress_start_is_async_and_reuses_running_job(monkeypatch, cle
     assert done_payload["summary"]["headline"] == "Compressed: 4 → 2 messages"
     assert done_payload["session"]["messages"] == [
         {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
         {"role": "assistant", "content": "four"},
     ]
+    assert done_payload["session"]["tool_calls"] == settled_tool_calls
+    persisted = Session.load(sid)
+    assert persisted.tool_calls == settled_tool_calls
+    # /compress now stamps missing message timestamps, so compare role/content
+    # rather than full-dict equality (mirrors test_session_compress_roundtrip).
+    assert [m.get("role") for m in persisted.context_messages] == ["user", "assistant"]
+    assert [m.get("content") for m in persisted.context_messages] == ["one", "four"]
 
 
 def test_session_compress_status_reports_worker_error_without_raw_paths(monkeypatch, cleanup_test_sessions):
@@ -462,7 +688,6 @@ def test_manual_compress_worker_uses_session_profile_env(monkeypatch, tmp_path, 
         }
 
     routes._run_manual_compression_job(sid, {"session_id": sid})
-
     assert EnvAssertingAgent.seen_env == {
         "HERMES_HOME": str(profile_home),
         "HERMES_TEST_PROFILE_ENV": "work-runtime",
@@ -471,8 +696,8 @@ def test_manual_compress_worker_uses_session_profile_env(monkeypatch, tmp_path, 
         "SKILL_MODULE_HOME": profile_home,
         "SKILL_MODULE_DIR": profile_home / "skills",
     }
-    assert str(getattr(fake_skill_module, "HERMES_HOME")) == "default-home"
-    assert str(getattr(fake_skill_module, "SKILLS_DIR")) == "default-home/skills"
+    assert str(fake_skill_module.HERMES_HOME) == "default-home"
+    assert str(fake_skill_module.SKILLS_DIR) == "default-home/skills"
     assert os.environ.get("HERMES_HOME") == "default-home"
     assert os.environ.get("HERMES_TEST_PROFILE_ENV") is None
     with routes._MANUAL_COMPRESSION_JOBS_LOCK:

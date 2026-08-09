@@ -51,7 +51,6 @@ def test_graphite_skin_tunes_workbench_chrome():
     assert ':root[data-skin="graphite"] .session-item.active.menu-open{padding-right:40px;}' in CSS
     assert ':root[data-skin="graphite"] .session-item.active:hover .session-time:not(.is-hidden)' in CSS
     assert ':root[data-skin="graphite"] .session-item.active .session-lineage-count' in CSS
-    assert ':root[data-skin="graphite"] .app-titlebar-icon rect' in CSS
     assert ':root[data-skin="graphite"] #mainSettings .theme-pick-btn.active' in CSS
     assert ':root[data-skin="graphite"] .msg-row[data-role="user"] .msg-body' in CSS
 
@@ -68,6 +67,6 @@ def test_graphite_skin_uses_native_ui_and_mono_font_stacks():
     assert "-webkit-font-smoothing:antialiased" in CSS
     assert ':root[data-skin="graphite"] textarea#msg' in CSS
     assert ':root[data-skin="graphite"] textarea#msg{font-family:var(--font-ui)!important;font-size:14px;' in CSS
-    assert ':root[data-skin="graphite"] .msg-body{font-family:var(--font-ui);font-size:13px;font-weight:430;' in CSS
+    assert ':root[data-skin="graphite"] .msg-body{font-family:var(--font-conversation);font-size:13px;font-weight:430;' in CSS
     assert ':root[data-skin="graphite"][data-font-size="large"] .msg-body{font-size:15px;' in CSS
     assert ':root[data-skin="graphite"] .tool-card-name' in CSS

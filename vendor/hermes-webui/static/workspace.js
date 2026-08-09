@@ -4,10 +4,15 @@ async function api(path,opts={}){
   const url=new URL(rel,document.baseURI||location.href);
   const timeoutMs=Object.prototype.hasOwnProperty.call(opts,'timeoutMs')?opts.timeoutMs:30000;
   const timeoutToast=opts.timeoutToast!==false;
+  const redirect401=opts.redirect401!==false;
+  const maxAttempts=Object.prototype.hasOwnProperty.call(opts,'retries')?Math.max(0,Number(opts.retries)||0)+1:3;
+  const retryTimeouts=opts.retryTimeouts===true;
+  const retryStatuses=Array.isArray(opts.retryStatuses)?opts.retryStatuses.map(Number).filter(Number.isFinite):[];
+  const retryDelayMs=Object.prototype.hasOwnProperty.call(opts,'retryDelayMs')?Math.max(0,Number(opts.retryDelayMs)||0):350;
   // Retry up to 2 times on network errors (e.g. stale keep-alive after long idle).
-  // Server errors (4xx/5xx) and client-side timeouts are NOT retried.
+  // Callers may opt into retrying timeouts / transient server statuses for idempotent GETs.
   let lastErr;
-  for(let attempt=0;attempt<3;attempt++){
+  for(let attempt=0;attempt<maxAttempts;attempt++){
     let controller=null;
     let timeoutId=null;
     let didTimeout=false;
@@ -17,6 +22,11 @@ async function api(path,opts={}){
       const fetchOpts={...opts};
       delete fetchOpts.timeoutMs;
       delete fetchOpts.timeoutToast;
+      delete fetchOpts.redirect401;
+      delete fetchOpts.retries;
+      delete fetchOpts.retryTimeouts;
+      delete fetchOpts.retryStatuses;
+      delete fetchOpts.retryDelayMs;
 
       const useTimeout=Number.isFinite(Number(timeoutMs))&&Number(timeoutMs)>0;
       if(useTimeout&&typeof AbortController!=='undefined'){
@@ -35,7 +45,25 @@ async function api(path,opts={}){
           // 401 means the auth session expired. Redirect to login so the user can
           // re-authenticate. This is especially important for iOS PWA (standalone mode)
           // and for subpath mounts like /hermes/, where /login escapes to the site root.
-          if(res.status===401){window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);return;}
+          if(res.status===401){
+            // #5578: if we're ALREADY on the login page, appending
+            // window.location.pathname+search (which contains ?next=…) into a
+            // fresh next= wraps the login URL into itself and re-encodes it —
+            // exponential URL growth on each expired-auth bounce until the tab
+            // breaks. On the login page, just reload login WITHOUT a next (the
+            // page preserves its own inner next); elsewhere, capture the path.
+            if(redirect401){
+              // Already on the login page? Reload login WITHOUT a next.
+              const _p=(window.location.pathname||'').replace(/\/+$/,'');
+              if(/(?:^|\/)login$/.test(_p)){
+                window.location.href='login';
+              }else{
+                window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);
+              }
+            }
+            // Callers can opt out of navigation and handle the unauthenticated state themselves.
+            return;
+          }
           const text=await res.text();
           // Parse JSON error body and surface the human-readable message,
           // rather than showing raw JSON like {"error":"Profile 'x' does not exist."}
@@ -69,6 +97,10 @@ async function api(path,opts={}){
       lastErr=e;
       const isTimeout=didTimeout||(e&&(e.timeout===true||e.name==='TimeoutError'));
       if(isTimeout){
+        if(retryTimeouts&&attempt<2&&attempt<maxAttempts-1){
+          if(retryDelayMs) await new Promise(resolve=>setTimeout(resolve,retryDelayMs*Math.pow(2,attempt)));
+          continue;
+        }
         const err=(e&&e.name==='TimeoutError')?e:new Error('Request timed out. Please try again.');
         err.name='TimeoutError';
         err.timeout=true;
@@ -78,7 +110,10 @@ async function api(path,opts={}){
       // Only retry on network errors (TypeError from fetch), not on HTTP errors
       // that were already thrown above. Re-throw 401 redirects immediately.
       if(e.message&&/401/.test(e.message)) throw e;
-      if(attempt<2 && e instanceof TypeError) continue;
+      if(attempt<2&&attempt<maxAttempts-1 && (e instanceof TypeError || retryStatuses.includes(Number(e.status)))){
+        if(retryDelayMs) await new Promise(resolve=>setTimeout(resolve,retryDelayMs*Math.pow(2,attempt)));
+        continue;
+      }
       throw e;
     }finally{
       if(timeoutId) clearTimeout(timeoutId);
@@ -123,8 +158,169 @@ function _restoreExpandedDirs(){
   }catch(e){S._expandedDirs=new Set();}
 }
 
+function _escapeGrantStore(){
+  if(!S._escapeGrants) S._escapeGrants = Object.create(null);
+  return S._escapeGrants;
+}
+
+function _normalizeWorkspaceRelPath(path){
+  let raw = String(path || '').trim().replace(/\\/g, '/');
+  if(!raw || raw === '.') return '.';
+  if(raw.startsWith('/')) return '';
+  const parts = [];
+  for(const part of raw.split('/')){
+    if(!part || part === '.') continue;
+    if(part === '..'){
+      if(parts.length) parts.pop();
+      else return '';
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.length ? parts.join('/') : '.';
+}
+
+function _isSameOrChildPath(base, path){
+  const normalizedBase = _normalizeWorkspaceRelPath(base);
+  const normalizedPath = _normalizeWorkspaceRelPath(path);
+  if(!normalizedBase || !normalizedPath) return false;
+  if(normalizedBase === '.') return true;
+  return normalizedPath === normalizedBase || normalizedPath.startsWith(`${normalizedBase}/`);
+}
+
+function _workspaceEscapeGrantForPath(path){
+  const grants = _escapeGrantStore();
+  const normalizedPath = _normalizeWorkspaceRelPath(path);
+  if(!normalizedPath || !S.session || !S.session.session_id) return null;
+  const sessionId = S.session.session_id;
+  let best = null;
+  for(const root of Object.keys(grants)){
+    const grant = grants[root];
+    if(!grant || grant.sessionId !== sessionId) continue;
+    if(grant.expiresAt && Date.now() >= grant.expiresAt){
+      delete grants[root];
+      continue;
+    }
+    if(!_isSameOrChildPath(root, normalizedPath)) continue;
+    if(!best || root.length > best.root.length) best = {root, grant};
+  }
+  return best ? best.grant : null;
+}
+
+function _workspaceEscapeExactGrant(path){
+  const normalizedPath = _normalizeWorkspaceRelPath(path);
+  const grant = _workspaceEscapeGrantForPath(normalizedPath);
+  if(!grant) return null;
+  return grant.path === normalizedPath ? grant : null;
+}
+
+function _storeWorkspaceEscapeGrant(data){
+  if(!S.session || !data || !data.token) return null;
+  const grants = _escapeGrantStore();
+  const root = _normalizeWorkspaceRelPath(data.path || '');
+  if(!root) return null;
+  const grant = {
+    sessionId: S.session.session_id,
+    path: root,
+    token: String(data.token),
+    expiresAt: Number(data.expires_at || 0) * 1000,
+    isDir: !!data.is_dir,
+  };
+  grants[root] = grant;
+  return grant;
+}
+
+function _clearWorkspaceEscapeGrant(path){
+  const grants = S._escapeGrants;
+  if(!grants) return;
+  const root = _normalizeWorkspaceRelPath(path);
+  if(root && grants[root]) delete grants[root];
+}
+
+function _workspacePathIsReadOnly(path){
+  return !!_workspaceEscapeGrantForPath(path || S.currentDir || '.');
+}
+
+function _workspaceRouteForPath(path, kind, opts={}){
+  // Resolve the app-relative "/api/…" route against document.baseURI so the
+  // URLs that are consumed OUTSIDE api() — previewImg.src, the media/pdf/html
+  // frame src, the download anchor, window.open — keep working under a subpath
+  // mount like /hermes/. A bare "/api/…" string resolves to the server root
+  // there and 404s. (api() strips the leading slash and re-resolves against
+  // baseURI itself, so routes passed through it are unaffected by already
+  // being absolute.)
+  const route=_workspaceRouteForPathRel(path, kind, opts);
+  if(!route) return route;
+  // Non-browser test harnesses have no document/location: keep the app-relative form.
+  const base=(typeof document!=='undefined'&&document.baseURI)||(typeof location!=='undefined'&&location.href)||'';
+  if(!base||!/^https?:\/\//i.test(base)) return route;
+  const rel=route.startsWith('/') ? route.slice(1) : route;
+  return new URL(rel, base).href;
+}
+
+function _workspaceRouteForPathRel(path, kind, opts={}){
+  if(!S.session) return '';
+  const normalizedPath = _normalizeWorkspaceRelPath(path);
+  const grant = _workspaceEscapeGrantForPath(normalizedPath);
+  const sessionId = encodeURIComponent(S.session.session_id);
+  const params = new URLSearchParams({session_id:S.session.session_id, path:normalizedPath || '.'});
+  if(grant){
+    params.set('token', grant.token);
+    if(kind === 'raw' && opts.download) params.set('download', '1');
+    if(kind === 'raw' && opts.inline) params.set('inline', '1');
+    if(kind === 'list') return `/api/escape/list?${params.toString()}`;
+    if(kind === 'read') return `/api/escape/file/read?${params.toString()}`;
+    if(kind === 'raw') return `/api/escape/file/raw?${params.toString()}`;
+  }
+  if(kind === 'list') return `/api/list?session_id=${sessionId}&path=${encodeURIComponent(normalizedPath || '.')}`;
+  if(kind === 'read') return `/api/file?session_id=${sessionId}&path=${encodeURIComponent(normalizedPath || '.')}`;
+  if(kind === 'raw'){
+    const extra = [];
+    if(opts.download) extra.push('download=1');
+    // Inline previews intentionally preserve a literal &inline=1 marker in this file.
+    if(opts.inline) extra.push('inline=1');
+    const suffix = extra.length ? `&${extra.join('&')}` : '';
+    return `/api/file/raw?session_id=${sessionId}&path=${encodeURIComponent(normalizedPath || '.')}${suffix}`;
+  }
+  return '';
+}
+
+async function authorizeWorkspaceEscapeNavigation(item){
+  if(!S.session || !item || !item.path) return null;
+  const normalizedPath = _normalizeWorkspaceRelPath(item.path);
+  const exactGrant = _workspaceEscapeExactGrant(normalizedPath);
+  if(!exactGrant){
+    const ok = await showConfirmDialog({
+      title: item.name || normalizedPath,
+      message: t('external_link_open_confirm'),
+      confirmLabel: t('dialog_confirm_btn'),
+      danger: false,
+      hideCancel: true,
+      focusCancel: false,
+    });
+    if(!ok) return null;
+  }
+  try{
+    const data = await api('/api/escape/authorize', {
+      method: 'POST',
+      body: JSON.stringify({
+        session_id: S.session.session_id,
+        path: normalizedPath,
+      }),
+    });
+    const grant = _storeWorkspaceEscapeGrant(data);
+    if(!grant) throw new Error('Missing escape authorization token');
+    showToast(t('external_link_read_only'), 2000);
+    return grant;
+  }catch(e){
+    showToast(t('external_link_grant_expired') || (e && e.message ? e.message : String(e)), 5000, 'error');
+    return null;
+  }
+}
+
 let _workspacePanelActiveTab = 'files';
 let _renderSessionArtifactsTimer = null;
+let _workspaceTodosLastRenderedHash = null;
 
 function _setWorkspacePanelTabDataset(){
   const panel = document.querySelector('.rightpanel');
@@ -139,16 +335,46 @@ function scheduleRenderSessionArtifacts(){
   }, 100);
 }
 
+function _workspaceTodosHash(items){
+  if(!Array.isArray(items)) return '';
+  let h=items.length+'|';
+  for(let i=0;i<items.length;i++){
+    const t=items[i]||{};
+    h+=String(t.id==null?'':t.id)+'\x1f'+String(t.content==null?(t.text==null?'':t.text):t.content)+'\x1f'+String(t.status==null?'':t.status)+'\x1e';
+  }
+  return h;
+}
+
+function _workspaceTodosTabIsActive(){
+  if(typeof window==='undefined'||window._workspaceTodosTab!==true) return false;
+  if(typeof document==='undefined') return false;
+  const rightPanel=document.querySelector('.rightpanel');
+  if(!rightPanel||!rightPanel.dataset||rightPanel.dataset.activeTab!=='todos') return false;
+  const tab=document.getElementById('workspaceTodosTab');
+  const panel=document.getElementById('workspaceTodosPanel');
+  return !!(tab&&panel&&!tab.hidden&&!panel.hidden);
+}
+
+function _resetWorkspaceTodosRenderCache(){
+  _workspaceTodosLastRenderedHash=null;
+}
+
+function _refreshWorkspacePanelTodos(){
+  if(!_workspaceTodosTabIsActive()) return;
+  _loadWorkspacePanelTodos();
+}
+
 if(typeof document !== 'undefined'){
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _setWorkspacePanelTabDataset, {once:true});
   else _setWorkspacePanelTabDataset();
 }
 
 function switchWorkspacePanelTab(tab){
-  _workspacePanelActiveTab = tab === 'artifacts' ? 'artifacts' : 'files';
+  _workspacePanelActiveTab = tab === 'artifacts' ? 'artifacts' : tab === 'todos' ? 'todos' : 'files';
   _setWorkspacePanelTabDataset();
   const filesTab = $('workspaceFilesTab');
   const artifactsTab = $('workspaceArtifactsTab');
+  const todosTab = $('workspaceTodosTab');
   if(filesTab){
     filesTab.classList.toggle('active', _workspacePanelActiveTab === 'files');
     filesTab.setAttribute('aria-selected', _workspacePanelActiveTab === 'files' ? 'true' : 'false');
@@ -157,9 +383,40 @@ function switchWorkspacePanelTab(tab){
     artifactsTab.classList.toggle('active', _workspacePanelActiveTab === 'artifacts');
     artifactsTab.setAttribute('aria-selected', _workspacePanelActiveTab === 'artifacts' ? 'true' : 'false');
   }
+  if(todosTab){
+    todosTab.classList.toggle('active', _workspacePanelActiveTab === 'todos');
+    todosTab.setAttribute('aria-selected', _workspacePanelActiveTab === 'todos' ? 'true' : 'false');
+  }
   const artifacts = $('workspaceArtifacts');
   if(artifacts) artifacts.hidden = _workspacePanelActiveTab !== 'artifacts';
+  const todosPanel = $('workspaceTodosPanel');
+  if(todosPanel) todosPanel.hidden = _workspacePanelActiveTab !== 'todos';
   if(_workspacePanelActiveTab === 'artifacts') renderSessionArtifacts();
+  if(_workspacePanelActiveTab === 'todos') _loadWorkspacePanelTodos();
+}
+
+function _loadWorkspacePanelTodos(){
+  const panel = $('workspaceTodosPanel');
+  if(!panel) return;
+  let todos = [];
+  try{
+    if(S && Array.isArray(S.todos)){
+      todos = S.todos;
+    } else if(S && S.session && S.session.todo_state && Array.isArray(S.session.todo_state.todos)){
+      todos = S.session.todo_state.todos;
+    } else if(typeof _legacyTodosFromMessages === 'function'){
+      todos = _legacyTodosFromMessages() || [];
+    }
+  }catch(e){ todos = []; }
+  if(!todos.length){
+    panel.innerHTML = renderTodoEmptyState({centered:true});
+    return;
+  }
+  panel.innerHTML = renderTodoRows(todos, {metadata:true});
+}
+
+function _escHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 const ARTIFACT_IGNORE_RE = /(^|\/)(?:\.git|\.hg|\.svn|node_modules|\.venv|venv|__pycache__|dist|build|\.next|\.cache)(?:\/|$)/;
@@ -329,12 +586,32 @@ function renderSessionArtifacts(){
     if(normWs && p.startsWith(normWs)) return p.slice(normWs.length);
     return p;
   };
-  root.innerHTML = items.map(item => `<button type="button" class="workspace-artifact-item" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)"><div class="workspace-artifact-path">${esc(displayPath(item.path))}</div><div class="workspace-artifact-meta">${esc(item.source || 'session')}</div></button>`).join('');
+  const splitArtifactDisplayPath = (path) => {
+    const slash = path.lastIndexOf('/');
+    if(slash < 0) return {name: path, head: '', tail: ''};
+    const directory = path.slice(0, slash + 1);
+    const parentSlash = directory.lastIndexOf('/', directory.length - 2);
+    return {
+      name: path.slice(slash + 1),
+      head: directory.slice(0, parentSlash + 1),
+      tail: directory.slice(parentSlash + 1),
+    };
+  };
+  root.innerHTML = items.map(item => {
+    const path = displayPath(item.path);
+    const parts = splitArtifactDisplayPath(path);
+    const directory = (parts.head || parts.tail)
+      ? `<div class="workspace-artifact-directory"><span class="workspace-artifact-directory-head">${esc(parts.head)}</span><span class="workspace-artifact-directory-tail">${esc(parts.tail)}</span></div>`
+      : '';
+    const source = item.source ? esc(item.source) : esc(t('workspace_artifact_source_session') || 'session');
+    const sourceAttrs = item.source ? '' : ' data-i18n="workspace_artifact_source_session"';
+    return `<button type="button" class="workspace-artifact-item" title="${esc(path)}" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)"><div class="workspace-artifact-filename">${esc(parts.name)}</div>${directory}<div class="workspace-artifact-meta"${sourceAttrs}>${source}</div></button>`;
+  }).join('');
 }
 
 async function _workspacePathExists(path){
   if(!S.session||!path) return false;
-  const parts=String(path).split('/').filter(Boolean);
+  const parts=String(path).replace(/\\/g,'/').split('/').filter(Boolean);
   const name=parts.pop();
   if(!name) return false;
   const dir=parts.length?parts.join('/'):'.';
@@ -345,9 +622,12 @@ async function _workspacePathExists(path){
 async function openArtifactPath(path){
   if(!path) return;
   switchWorkspacePanelTab('files');
-  let rel = path.replace(/^~\//,'').replace(/^\.\/+/,'');
+  // Normalize backslash separators to '/' first — Windows absolute paths
+  // (e.g. "D:\workspace\dir\file") otherwise break prefix-strip and the
+  // /api/list existence check (which splits on '/').
+  let rel = String(path).replace(/\\/g,'/').replace(/^~\//,'').replace(/^(?:\.\/)+/,'');
   // Strip workspace prefix so /api/list receives a workspace-relative path.
-  const ws = S.session && S.session.workspace;
+  const ws = (S.session && S.session.workspace || '').replace(/\\/g,'/');
   if(ws){
     const normWs = ws.replace(/\/+$/,'') + '/';
     if(rel.startsWith(normWs)) rel = rel.slice(normWs.length);
@@ -366,33 +646,124 @@ async function openArtifactPath(path){
   openFile(rel);
 }
 
+// ── Workspace file-tree loading skeleton (#4662 Phase 1) ────────────────────
+// During a profile switch the right-hand workspace panel would otherwise keep
+// showing the previous profile's file tree until /api/list resolves. Show a
+// clean tree-shaped skeleton in its place (panel stays open — hiding it is
+// jarring). Varied bar widths + a small indent pattern so it reads as a real
+// directory listing rather than a mechanical repeat.
+const _WS_SKELETON_ROWS = [
+  {w: 38, indent: 0, dir: true},
+  {w: 72, indent: 0},
+  {w: 44, indent: 1},
+  {w: 63, indent: 1},
+  {w: 80, indent: 0},
+  {w: 51, indent: 1},
+  {w: 67, indent: 0},
+  {w: 39, indent: 1},
+];
+
+// Workspace-tree render generation. loadDir() captures this at call time and
+// discards its render/cache writes if a newer generation started meanwhile.
+// #4671 CORE: an empty-session profile switch REUSES the same session_id, so
+// loadDir()'s session_id guard alone can't reject a pre-switch /api/list response
+// that resolves after the new profile's loadDir('.') — it would paint the previous
+// workspace's files over the switched-to profile. switchToProfile() bumps this
+// UNCONDITIONALLY at switch start (even when the workspace panel is closed, since
+// loadDir('.') still runs then), so the stale response is rejected.
+let _wsTreeGen = 0;
+function bumpWorkspaceTreeGen(){
+  _wsTreeGen = (typeof _wsTreeGen === 'number' ? _wsTreeGen : 0) + 1;
+  return _wsTreeGen;
+}
+if(typeof window!=='undefined') window.bumpWorkspaceTreeGen = bumpWorkspaceTreeGen;
+
+function showWorkspaceTreeSkeleton(){
+  const tree = $('fileTree');
+  if(!tree) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'skeleton-tree';
+  wrap.setAttribute('aria-hidden', 'true');
+  for(const spec of _WS_SKELETON_ROWS){
+    const row = document.createElement('div');
+    row.className = 'skeleton-tree-row';
+    if(spec.indent) row.style.paddingLeft = (2 + spec.indent * 16) + 'px';
+    const glyph = document.createElement('div');
+    glyph.className = 'skeleton-glyph';
+    const name = document.createElement('div');
+    name.className = 'skeleton-bar skeleton-name';
+    name.style.width = spec.w + '%';
+    row.appendChild(glyph);
+    row.appendChild(name);
+    // Files (not dirs) show a size on the right; mirror that on leaf rows.
+    if(!spec.dir){
+      const size = document.createElement('div');
+      size.className = 'skeleton-bar skeleton-size';
+      row.appendChild(size);
+    }
+    wrap.appendChild(row);
+  }
+  tree.innerHTML = '';
+  tree.appendChild(wrap);
+  tree.style.display = '';
+}
+
+// Clear a stranded workspace-tree skeleton (#4662 Opus gate). showWorkspaceTreeSkeleton()
+// is shown up front on a profile switch, but the real loadDir('.') that would
+// replace it is skipped when the new profile has no bound workspace — leaving a
+// shimmering skeleton forever. Call this on the no-workspace path so the tree
+// empties instead. Only touches #fileTree when it still holds a skeleton, so
+// it can't clobber a real render.
+function clearWorkspaceTreeSkeleton(){
+  const tree = $('fileTree');
+  if(!tree) return;
+  if(tree.querySelector('.skeleton-tree')) tree.innerHTML = '';
+}
+
 async function loadDir(path, opts={}){
   const preservePreview=!!(opts&&opts.preservePreview);
+  const refreshExpanded=!!(opts&&opts.refreshExpanded);
   if(!S.session)return;
   const sessionId=S.session.session_id;
+  const treeGen=_wsTreeGen;  // #4671: capture the workspace-tree generation. A profile
+                             // switch bumps it (bumpWorkspaceTreeGen), so a stale response
+                             // from the previous workspace — which would pass the session_id
+                             // guard because an empty-session switch reuses the same id — is
+                             // rejected here instead of painting the wrong profile's files.
   try{
-    if(!path||path==='.'){
+    if(!path||path==='.'||refreshExpanded){
       S._dirCache={};
-      _restoreExpandedDirs();  // restore per-workspace expanded state on root load
+      _restoreExpandedDirs();  // restore per-workspace expanded state after root and refresh resets
     }
     S.currentDir=path||'.';
-    const data=await api(`/api/list?session_id=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`);
-    if(!S.session||S.session.session_id!==sessionId)return;
+    const data=await api(
+      _workspaceRouteForPath(path, 'list') ||
+      `/api/list?session_id=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path||'.')}`
+    );
+    if(!S.session||S.session.session_id!==sessionId||treeGen!==_wsTreeGen)return;
+    if(data.workspace_recovered&&data.workspace){
+      S.session.workspace=String(data.workspace);
+      S._dirCache={};
+      _restoreExpandedDirs();
+      if(typeof syncWorkspaceDisplays==='function')syncWorkspaceDisplays();
+      if(typeof syncTerminalButton==='function')syncTerminalButton();
+      showToast(t('workspace_recovered_notice',S.session.workspace),5000,'warning');
+    }
     S.entries=data.entries||[];renderBreadcrumb();renderFileTree();
     // #2673 — refresh Artifacts tab when its source data (the file tree) updates.
     if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
     // Pre-fetch contents of restored expanded dirs so they render without a second click
     // (parallelized — avoids serial waterfall when multiple dirs are expanded)
-    if(!path||path==='.'){
+    if(!path||path==='.'||refreshExpanded){
       const expanded=S._expandedDirs||new Set();
       const pending=[...expanded].filter(dirPath=>!S._dirCache[dirPath]);
       if(pending.length){
         const results=await Promise.all(pending.map(dirPath=>
-          api(`/api/list?session_id=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(dirPath)}`)
+          api(_workspaceRouteForPath(dirPath, 'list'))
             .then(dc=>({dirPath,entries:dc.entries||[]}))
             .catch(()=>({dirPath,entries:[]}))
         ));
-        if(!S.session||S.session.session_id!==sessionId)return;
+        if(!S.session||S.session.session_id!==sessionId||treeGen!==_wsTreeGen)return;
         for(const {dirPath,entries} of results) S._dirCache[dirPath]=entries;
       }
       if(expanded.size>0)renderFileTree();
@@ -408,7 +779,21 @@ async function loadDir(path, opts={}){
     }
     // Fetch git info for workspace root (non-blocking)
     if(!path||path==='.') _refreshGitBadge();
-  }catch(e){console.warn('loadDir',e);}
+  }catch(e){
+    const grant = _workspaceEscapeGrantForPath(path);
+    if(grant && e && e.status===403){
+      _clearWorkspaceEscapeGrant(grant.path);
+      showToast(t('external_link_grant_expired') || t('file_open_failed'), 5000, 'error');
+      return;
+    }
+    console.warn('loadDir',e);
+  }
+}
+
+function refreshWorkspacePanel(){
+  if(!S.session)return;
+  const targetDir = S.currentDir || '.';
+  loadDir(targetDir,{refreshExpanded:true});
 }
 
 async function _refreshGitBadge(){
@@ -455,7 +840,7 @@ const MD_PREVIEW_RICH_RENDER_MAX_BYTES = 256 * 1024;
 const MD_PREVIEW_RICH_RENDER_MAX_LINES = 5000;
 // Binary formats that should download rather than preview
 const DOWNLOAD_EXTS = new Set([
-  '.docx','.doc','.xlsx','.xls','.pptx','.ppt','.odt','.ods','.odp',
+  '.doc','.xls','.ppt','.odt','.ods','.odp',
   '.zip','.tar','.gz','.bz2','.7z','.rar',
   '.exe','.dmg','.pkg','.deb','.rpm',
   '.woff','.woff2','.ttf','.otf','.eot',
@@ -495,9 +880,55 @@ function setLargeMarkdownForceRenderVisible(visible){
 }
 
 function renderMarkdownPreviewContent(data){
-  showPreview('md');
-  $('previewMd').innerHTML=renderMd(data.content);
+  const target=data&&data.el?data.el:$('previewMd');
+  if(!data||!data.el) showPreview('md');
+  target.innerHTML=renderMd(data.content);
   requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();});
+}
+
+function renderCodePreviewContent(path, content){
+  showPreview('code');
+  const codeEl=document.createElement('code');
+  codeEl.textContent=content;
+  const lang=_prismLanguageForPath(path);
+  if(lang) codeEl.className='language-'+lang;
+  const pre=$('previewCode');
+  pre.textContent='';
+  // Prism.highlightElement() propagates the language-* class onto the
+  // parent <pre>, so a previously-previewed code file leaves e.g.
+  // "language-css" on #previewCode. A subsequent plain-text file builds a
+  // class-less <code>, and Prism walks up to that stale ancestor class and
+  // mis-highlights prose. Strip any inherited language-* token from the
+  // <pre> before each render so highlighting never leaks across files.
+  pre.className=pre.className.replace(/\blanguage-\S+/g,'').replace(/\s+/g,' ').trim();
+  pre.appendChild(codeEl);
+  // Only invoke Prism when we actually assigned a language; otherwise the
+  // class-less <code> would inherit any ancestor language-* class.
+  if(lang&&typeof Prism!=='undefined'&&typeof Prism.highlightElement==='function'){
+    Prism.highlightElement(codeEl);
+  }
+}
+
+function renderCsvPreviewContent(path, content){
+  if(typeof buildCsvTablePreview!=='function') return false;
+  const preview=buildCsvTablePreview(path, content);
+  if(!preview) return false;
+  showPreview('csv');
+  // Preserve the raw CSV text so the Edit flow can repopulate the textarea and
+  // a save can re-render the table from the edited source (#4025 review, Codex).
+  if(typeof content==='string'){
+    _previewRawContent = content;
+    _previewRawContentPath = path;
+  }
+  if(preview.html){
+    $('previewMd').innerHTML=preview.html;
+    return true;
+  }
+  if(preview.errorKey&&typeof _csvPreviewErrorHtml==='function'){
+    $('previewMd').innerHTML=_csvPreviewErrorHtml(path, preview.errorKey);
+    return true;
+  }
+  return false;
 }
 
 function forceRenderMarkdownPreview(){
@@ -511,21 +942,25 @@ function forceRenderMarkdownPreview(){
 }
 
 let _previewCurrentPath = '';  // relative path of currently previewed file
-let _previewCurrentMode = '';  // 'code' | 'md' | 'image' | 'html' | 'pdf' | 'audio' | 'video'
+let _previewCurrentMode = '';  // 'code' | 'csv' | 'md' | 'image' | 'html' | 'pdf' | 'audio' | 'video'
 let _previewDirty = false;     // true when edits are unsaved
+let _previewServerEditable = null;  // backend editability metadata when available
+let _previewSaveRoute = '/api/file/save';  // current save adapter for the open preview
+let _previewOfficeFormat = '';  // current claimed Office format, if any
+let _previewPreviewKind = '';  // preview family returned by the backend
 
 function showPreview(mode){
-  // mode: 'code' | 'image' | 'md' | 'html' | 'pdf' | 'audio' | 'video'
+  // mode: 'code' | 'csv' | 'image' | 'md' | 'html' | 'pdf' | 'audio' | 'video'
   $('previewCode').style.display     = mode==='code'  ? '' : 'none';
   $('previewImgWrap').style.display  = mode==='image' ? '' : 'none';
   const mediaWrap=$('previewMediaWrap'); if(mediaWrap) mediaWrap.style.display = (mode==='audio'||mode==='video') ? '' : 'none';
   const pdfWrap=$('previewPdfWrap'); if(pdfWrap) pdfWrap.style.display = mode==='pdf' ? '' : 'none';
-  $('previewMd').style.display       = mode==='md'    ? '' : 'none';
+  $('previewMd').style.display       = (mode==='md'||mode==='csv') ? '' : 'none';
   $('previewHtmlWrap').style.display = mode==='html'  ? '' : 'none';
   $('previewEditArea').style.display = 'none';  // start in read-only
   const badge=$('previewBadge');
   badge.className='preview-badge '+mode;
-  badge.textContent = mode==='image'?'image':mode==='audio'?'audio':mode==='video'?'video':mode==='pdf'?'pdf':mode==='md'?'md':mode==='html'?'html':fileExt($('previewPathText').textContent)||'text';
+  badge.textContent = mode==='image'?'image':mode==='audio'?'audio':mode==='video'?'video':mode==='pdf'?'pdf':mode==='csv'?'csv':mode==='md'?'md':mode==='html'?'html':fileExt($('previewPathText').textContent)||'text';
   _previewCurrentMode = mode;
   _previewDirty = false;
   updateEditBtn();
@@ -538,7 +973,10 @@ function showPreview(mode){
 function updateEditBtn(){
   const btn=$('btnEditFile');
   if(!btn)return;
-  const editable = _previewCurrentMode==='code'||_previewCurrentMode==='md';
+  const editable = !_workspacePathIsReadOnly(_previewCurrentPath)
+    && (_previewServerEditable===null
+      ? (_previewCurrentMode==='code'||_previewCurrentMode==='md'||_previewCurrentMode==='csv')
+      : !!_previewServerEditable);
   btn.style.display = editable?'':'none';
   const editing = $('previewEditArea').style.display!=='none';
   btn.innerHTML = editing ? `&#128190; ${t('save')}` : `&#9998; ${t('edit')}`;
@@ -549,22 +987,38 @@ function updateEditBtn(){
 
 async function toggleEditMode(){
   const editing = $('previewEditArea').style.display!=='none';
+  if(_workspacePathIsReadOnly(_previewCurrentPath)){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
+  if(!editing && _previewServerEditable===false){
+    showToast('This Office document is preview-only.', 3000, 'error');
+    return;
+  }
   if(editing){
     // Save
     if(!S.session||!_previewCurrentPath)return;
     const content=$('previewEditArea').value;
     try{
-      await api('/api/file/save',{method:'POST',body:JSON.stringify({
+      const saved=await api(_previewSaveRoute||'/api/file/save',{method:'POST',body:JSON.stringify({
         session_id:S.session.session_id, path:_previewCurrentPath, content
       })});
+      const savedContent=saved&&typeof saved.content==='string'?saved.content:content;
+      if(saved && typeof saved.editable==='boolean') _previewServerEditable = saved.editable;
+      if(saved && saved.preview_kind) _previewPreviewKind = saved.preview_kind;
+      if(saved && saved.office_format) _previewOfficeFormat = saved.office_format;
+      if(saved && saved.preview_kind==='office' && saved.office_format==='docx'){
+        _previewSaveRoute = '/api/file/office-save';
+      }
       _previewDirty=false;
       // Update read-only views AND the cached raw content so a later
       // "Render as markdown anyway" force-render reflects the just-saved text
       // (not the stale pre-edit fetch). #3378 review (Codex).
-      _previewRawContent = content;
+      _previewRawContent = savedContent;
       _previewRawContentPath = _previewCurrentPath;
-      if(_previewCurrentMode==='code') $('previewCode').textContent=content;
-      else renderMarkdownPreviewContent({content});
+      if(_previewCurrentMode==='code') $('previewCode').textContent=savedContent;
+      else if(_previewCurrentMode==='csv') renderCsvPreviewContent(_previewCurrentPath, savedContent);
+      else renderMarkdownPreviewContent({content:savedContent});
       $('previewEditArea').style.display='none';
       if(_previewCurrentMode==='code') $('previewCode').style.display='';
       else $('previewMd').style.display='';
@@ -647,6 +1101,11 @@ async function openFile(path, opts={}){
     return;
   }
 
+  _previewServerEditable = null;
+  _previewSaveRoute = '/api/file/save';
+  _previewOfficeFormat = '';
+  _previewPreviewKind = '';
+
   $('previewPathText').textContent=path;
   $('previewArea').classList.add('visible');
   $('fileTree').style.display='none';
@@ -656,14 +1115,14 @@ async function openFile(path, opts={}){
   if(IMAGE_EXTS.has(ext)){
     // Image: load via raw endpoint, show as <img>
     showPreview('image');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}${cacheBust}`;
+    const url=_workspaceRouteForPath(path, 'raw') + cacheBust;
     $('previewImg').alt=path;
     $('previewImg').src=url;
     $('previewImg').onerror=()=>setStatus(t('image_load_failed'));
   } else if(AUDIO_EXTS.has(ext)||VIDEO_EXTS.has(ext)){
     const mode=VIDEO_EXTS.has(ext)?'video':'audio';
     showPreview(mode);
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
+    const url=_workspaceRouteForPath(path, 'raw', {inline:true}) + cacheBust;
     const wrap=$('previewMediaWrap');
     if(wrap){
       wrap.innerHTML=(typeof _mediaPlayerHtml==='function')
@@ -673,7 +1132,7 @@ async function openFile(path, opts={}){
     }
   } else if(PDF_EXTS.has(ext)){
     showPreview('pdf');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
+    const url=_workspaceRouteForPath(path, 'raw', {inline:true}) + cacheBust;
     const frame=$('previewPdfFrame');
     if(frame){
       frame.src=''; // clear first to avoid stale content
@@ -690,7 +1149,7 @@ async function openFile(path, opts={}){
       // file switch could re-render the previous file's cached content.
       const data=forceRichMarkdown&&path===_previewRawContentPath&&_previewRawContent
         ? {content:_previewRawContent}
-        : await api(`/api/file?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
+        : await api(_workspaceRouteForPath(path, 'read'));
       _previewRawContent = data.content;
       _previewRawContentPath = path;
       if(!forceRichMarkdown && shouldRenderMarkdownPreviewAsPlainText(data.content)){
@@ -712,43 +1171,49 @@ async function openFile(path, opts={}){
     // or reading other origin data. If a stricter mode is needed, remove
     // allow-scripts (or add sandbox="") to disable all JS execution.
     showPreview('html');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
+    const url=_workspaceRouteForPath(path, 'raw', {inline:true}) + cacheBust;
     const iframe=$('previewHtmlIframe');
     if(iframe){
       iframe.src=''; // clear first to avoid stale content
       iframe.src=url;
     }
+  } else if(ext==='.csv'){
+    try{
+      const data=await api(_workspaceRouteForPath(path, 'read'));
+      if(data.binary){
+        downloadFile(path);
+        return;
+      }
+      if(renderCsvPreviewContent(path, data.content)) return;
+      renderCodePreviewContent(path, data.content);
+    }catch(e){
+      downloadFile(path);
+    }
   } else {
     // Plain code / text -- but fall back to download if server signals binary
     try{
-      const data=await api(`/api/file?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
+      const data=await api(_workspaceRouteForPath(path, 'read'));
       if(data.binary){
         // Server flagged this as binary content
         downloadFile(path);
         return;
       }
-      showPreview('code');
-      // Syntax highlighting with Prism.js (already loaded on the page).
-      const codeEl=document.createElement('code');
-      codeEl.textContent=data.content;
-      const lang=_prismLanguageForPath(path);
-      if(lang) codeEl.className='language-'+lang;
-      const pre=$('previewCode');
-      pre.textContent='';
-      // Prism.highlightElement() propagates the language-* class onto the
-      // parent <pre>, so a previously-previewed code file leaves e.g.
-      // "language-css" on #previewCode. A subsequent plain-text file builds a
-      // class-less <code>, and Prism walks up to that stale ancestor class and
-      // mis-highlights prose. Strip any inherited language-* token from the
-      // <pre> before each render so highlighting never leaks across files.
-      pre.className=pre.className.replace(/\blanguage-\S+/g,'').replace(/\s+/g,' ').trim();
-      pre.appendChild(codeEl);
-      // Only invoke Prism when we actually assigned a language; otherwise the
-      // class-less <code> would inherit any ancestor language-* class.
-      if(lang&&typeof Prism!=='undefined'&&typeof Prism.highlightElement==='function'){
-        Prism.highlightElement(codeEl);
+      if(data.preview_kind==='office'){
+        _previewRawContent = data.content || '';
+        _previewRawContentPath = path;
+        _previewServerEditable = typeof data.editable === 'boolean' ? data.editable : null;
+        _previewPreviewKind = data.preview_kind || '';
+        _previewOfficeFormat = data.office_format || '';
+        _previewSaveRoute = data.preview_kind==='office' ? '/api/file/office-save' : '/api/file/save';
       }
-    }catch(e){
+      renderCodePreviewContent(path, data.content);
+  }catch(e){
+      const grant = _workspaceEscapeGrantForPath(path);
+      if(grant && e && e.status===403){
+        _clearWorkspaceEscapeGrant(grant.path);
+        showToast(t('external_link_grant_expired') || t('file_open_failed'), 5000, 'error');
+        return;
+      }
       // If it's a 400/too-large error, offer download instead
       downloadFile(path);
     }
@@ -758,7 +1223,7 @@ async function openFile(path, opts={}){
 function downloadFile(path){
   if(!S.session)return;
   // Trigger browser download via the raw file endpoint with content-disposition attachment
-  const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&download=1`;
+  const url=_workspaceRouteForPath(path, 'raw', {download:true});
   const filename=path.split('/').pop();
   const a=document.createElement('a');
   a.href=url;a.download=filename;
@@ -808,12 +1273,50 @@ function renderFileBreadcrumb(filePath) {
 
 function openInBrowser(){
   if(!_previewCurrentPath||!S.session) return;
-  const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(_previewCurrentPath)}&inline=1`;
+  const url=_workspaceRouteForPath(_previewCurrentPath, 'raw', {inline:true});
   window.open(url,'_blank','noopener');
+}
+// openInBrowser keeps the helper-based raw path, which expands to an explicit &inline=1 URL.
+
+async function copyPreviewRelativePath(){
+  if(!_previewCurrentPath) return;
+  const btn=$('btnCopyPreviewRelPath');
+  if(btn&&btn.disabled) return;
+  if(btn) btn.disabled=true;
+  try{
+    const rel=_normalizeWorkspaceRelPath(_previewCurrentPath)||_previewCurrentPath;
+    if(typeof _copyTextWithFallback==='function'){
+      await _copyTextWithFallback(rel,t('path_copied'),t('path_copy_failed'));
+      return;
+    }
+    try{
+      await navigator.clipboard.writeText(rel);
+      showToast(t('path_copied'));
+    }catch(clipErr){
+      const ta=document.createElement('textarea');
+      ta.value=rel;
+      ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
+      document.body.appendChild(ta);
+      ta.select();
+      let copied=false;
+      try{copied=document.execCommand('copy');}catch(_){}
+      ta.remove();
+      if(copied) showToast(t('path_copied'));
+      else showToast(t('path_copy_failed')+(clipErr&&clipErr.message?clipErr.message:String(clipErr)));
+    }
+  }catch(err){
+    showToast(t('path_copy_failed')+(err.message||err));
+  }finally{
+    if(btn) btn.disabled=false;
+  }
 }
 
 // ── Workspace upload ──────────────────────────────────────────────────
 function triggerWorkspaceUpload() {
+  if(_workspacePathIsReadOnly(S.currentDir || '.')){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
   const input = $('workspaceFileInput');
   if (!input) return;
   input.value = '';
@@ -830,6 +1333,10 @@ function triggerWorkspaceUpload() {
 
 async function uploadToWorkspace(file, dir) {
   if (!S.session) return;
+  if(_workspacePathIsReadOnly(dir || '.')){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
   const formData = new FormData();
   formData.append('session_id', S.session.session_id);
   formData.append('path', dir || '.');
@@ -927,6 +1434,10 @@ async function _collectOsDropUploads(dataTransfer) {
 
 async function uploadOsDropToWorkspace(dataTransfer, destDir) {
   if (!S.session || !dataTransfer) return;
+  if(_workspacePathIsReadOnly(destDir || '.')){
+    showToast(t('external_link_read_only'), 2000);
+    return;
+  }
   const uploads = await _collectOsDropUploads(dataTransfer);
   for (const { file, relDir } of uploads) {
     await uploadToWorkspace(file, _targetDirForRelDir(destDir, relDir));
@@ -971,6 +1482,10 @@ function _bindWorkspaceOsUploadDropTarget(el, destDir) {
     e.preventDefault();
     e.stopPropagation();
     el.classList.remove('drag-over-upload');
+    if(_workspacePathIsReadOnly(destDir || '.')){
+      showToast(t('external_link_read_only'), 2000);
+      return;
+    }
     await uploadOsDropToWorkspace(e.dataTransfer, destDir);
   });
 }
@@ -990,7 +1505,7 @@ if (typeof document !== 'undefined') {
       if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
         e.preventDefault();
         e.stopPropagation();
-        if (e.target.closest('.file-item[data-ws-type="dir"],.breadcrumb-seg')) return;
+        if (e.target.closest('.file-item[data-ws-type="dir"],.file-item[data-ws-is-dir="true"],.breadcrumb-seg')) return;
         e.dataTransfer.dropEffect = 'copy';
         tree.classList.add('drag-over-upload');
       }
@@ -1002,9 +1517,13 @@ if (typeof document !== 'undefined') {
     tree.addEventListener('drop', async (e) => {
       tree.classList.remove('drag-over-upload');
       if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes('Files')) return;
-      if (e.target.closest('.file-item[data-ws-type="dir"],.breadcrumb-seg')) return;
+      if (e.target.closest('.file-item[data-ws-type="dir"],.file-item[data-ws-is-dir="true"],.breadcrumb-seg')) return;
       e.preventDefault();
       e.stopPropagation();
+      if(_workspacePathIsReadOnly(S.currentDir || '.')){
+        showToast(t('external_link_read_only'), 2000);
+        return;
+      }
       await uploadOsDropToWorkspace(e.dataTransfer, S.currentDir || '.');
     });
   };

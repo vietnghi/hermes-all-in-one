@@ -106,7 +106,7 @@ def test_wheel_touch_upward_intent_unpins_immediately_inside_messages():
     fn_end = UI_JS.index("function _recentNonMessageScrollIntent", fn_start)
     fn = UI_JS[fn_start:fn_end]
     assert "_messageUserUnpinned=true" in fn.replace(" ", "")
-    assert "e.deltaY<0" in fn and "e.type==='touchmove'" in fn
+    assert "e.deltaY< -30" in fn and "e.type==='touchmove'" in fn
 
 
 def test_downward_path_preserves_macos_momentum_hysteresis():
@@ -126,7 +126,7 @@ def test_repin_threshold_is_still_250px():
     stay. Direction detection is the new lever, not threshold relaxation.
     """
     block = _scroll_listener_block()
-    assert "clientHeight<250" in block, (
+    assert "clientHeight<250" in block or "bottomDistance<250" in block, (
         "The 250px re-pin dead zone must remain — #1360 / #677 require it "
         "for macOS small-window + trackpad momentum cases. The #1731 fix "
         "uses direction detection, not threshold changes."
@@ -143,7 +143,7 @@ def test_programmatic_scroll_guard_still_skips_listener():
     end = UI_JS.index("})", brace)
     listener = UI_JS[brace:end]
 
-    bail_idx = listener.index("if(_programmaticScroll) return")
+    bail_idx = listener.index("if(_freshProgrammaticScrollActive()) return")
     raf_idx = listener.index("requestAnimationFrame")
     assert bail_idx < raf_idx, (
         "The _programmaticScroll guard must run before requestAnimationFrame "

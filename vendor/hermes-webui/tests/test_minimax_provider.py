@@ -29,17 +29,20 @@ def _force_env_fallback(monkeypatch):
 def _run_available_models_with_cfg(monkeypatch, tmp_path, cfg):
     old_cfg = dict(config.cfg)
     old_mtime = config._cfg_mtime
+    old_path = getattr(config, "_cfg_path", None)
     monkeypatch.setattr(config, "_models_cache_path", tmp_path / "models_cache.json")
     monkeypatch.setattr(config, "_get_config_path", lambda: tmp_path / "missing-config.yaml")
     config.cfg.clear()
     config.cfg.update(cfg)
     config._cfg_mtime = 0.0
+    config._cfg_path = config._get_config_path()
     try:
         return config.get_available_models()
     finally:
         config.cfg.clear()
         config.cfg.update(old_cfg)
         config._cfg_mtime = old_mtime
+        config._cfg_path = old_path
 
 
 @pytest.fixture(autouse=True)
@@ -146,10 +149,10 @@ def test_minimax_cn_provider_models_match_hermes_agent_catalog():
     """minimax-cn must have its own static catalog so an empty config provider still shows models."""
     models = config._PROVIDER_MODELS.get('minimax-cn', [])
     ids = [m['id'] for m in models]
-    assert ids == [
-        'MiniMax-M3',
-        'MiniMax-M2.7',
-    ]
+    # _seed_provider_models_from_core() may have enriched the static list at
+    # import time, so assert the curated entries are a subset rather than an
+    # exact match (#4413).
+    assert {'MiniMax-M3', 'MiniMax-M2.7'}.issubset(set(ids)), ids
     assert config._PROVIDER_DISPLAY.get('minimax-cn') == 'MiniMax (China)'
 
 
@@ -205,10 +208,13 @@ def test_minimax_cn_detected_from_os_environ(monkeypatch, tmp_path):
 
     assert 'minimax-cn' in groups, f"minimax-cn group missing: {groups.keys()}"
     assert groups['minimax-cn']['provider'] == 'MiniMax (China)'
-    assert {m['id'] for m in groups['minimax-cn']['models']} == {
-        'MiniMax-M3',
-        'MiniMax-M2.7',
-    }
+    # _seed_provider_models_from_core() may have enriched the static list at
+    # import time, so assert the curated entries are a subset rather than an
+    # exact match (#4413).
+    cn_ids = {m['id'] for m in groups['minimax-cn']['models']}
+    assert {'MiniMax-M3', 'MiniMax-M2.7'}.issubset(cn_ids), (
+        f"Expected curated MiniMax-CN models in {cn_ids}"
+    )
     assert 'minimax' not in groups, (
         "MINIMAX_CN_API_KEY must not be collapsed into the global minimax provider"
     )

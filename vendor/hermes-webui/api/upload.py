@@ -4,13 +4,13 @@ Hermes Web UI -- File upload: multipart parser and upload handler.
 import mimetypes
 import os
 import re as _re
-import email.parser
 import tempfile
 from pathlib import Path
 
 from api.config import MAX_UPLOAD_BYTES, STATE_DIR
-from api.helpers import j, bad
+from api.helpers import j
 from api.models import get_session
+from api.profiles import _profiles_match, get_active_profile_name as _get_active_profile_name
 from api.workspace import (
     safe_resolve_ws,
     resolve_trusted_workspace,
@@ -74,7 +74,6 @@ def parse_multipart(rfile, content_type, content_length) -> tuple:
     fields = {}
     files = {}
     delimiter = b'--' + boundary
-    end_marker = b'--' + boundary + b'--'
     parts = raw.split(delimiter)
     for part in parts[1:]:
         stripped = part.lstrip(b'\r\n')
@@ -150,6 +149,60 @@ def _session_attachment_dir(session_id: str, *, root: Path | None = None) -> Pat
     return dest_dir
 
 
+def _session_visible_to_active_profile(session) -> bool:
+    """Return whether an upload target session belongs to the active profile."""
+    session_profile = getattr(session, 'profile', None)
+    if not isinstance(session_profile, str):
+        session_profile = None
+    return _profiles_match(session_profile, _get_active_profile_name())
+
+
+def _reject_invisible_session(handler, session) -> bool:
+    if _session_visible_to_active_profile(session):
+        return False
+    j(handler, {'error': 'Session not found'}, status=404)
+    return True
+
+
+def _write_office_upload_sidecar(workspace: Path, dest: Path, file_bytes: bytes) -> dict | None:
+    """Write a Markdown preview sidecar for supported Office uploads."""
+    if dest.suffix.lower() not in {'.docx', '.xlsx', '.pptx'}:
+        return None
+
+    error_message = 'Office sidecar extraction failed'
+    sidecar = dest.with_name(f'{dest.name}.md')
+    sidecar_path = sidecar.resolve()
+    created_sidecar = False
+    try:
+        from api.office_documents import preview_office_document
+
+        preview = preview_office_document(dest.name, file_bytes)
+        if not sidecar_path.is_relative_to(workspace.resolve()):
+            raise ValueError('Invalid sidecar destination')
+        sidecar_fd = open_anchored_create_fd(workspace, sidecar_path)
+        created_sidecar = True
+        with os.fdopen(sidecar_fd, 'w', encoding='utf-8', closefd=True) as sidecar_file:
+            sidecar_file.write(str(preview.get('content') or ''))
+        return {
+            'filename': sidecar_path.name,
+            'path': str(sidecar_path),
+            'size': sidecar_path.stat().st_size,
+            'preview_kind': preview.get('preview_kind'),
+            'office_format': preview.get('office_format'),
+        }
+    except FileExistsError:
+        return {'error': error_message}
+    except Exception:
+        if created_sidecar:
+            try:
+                unlink_anchored(workspace, sidecar_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+        return {'error': error_message}
+
+
 def handle_upload(handler):
     import traceback as _tb
     try:
@@ -168,6 +221,8 @@ def handle_upload(handler):
             s = get_session(session_id)
         except KeyError:
             return j(handler, {'error': 'Session not found'}, status=404)
+        if _reject_invisible_session(handler, s):
+            return True
         safe_name = _sanitize_upload_name(filename)
         dest = _upload_destination(session_id, safe_name)
         dest.write_bytes(file_bytes)
@@ -192,7 +247,7 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
     Returns a dict with ``extracted`` (int), ``files`` (list[str]).
     Raises ValueError on zip-slip or unsupported format.
     """
-    import zipfile, tarfile, io, os, shutil
+    import zipfile, tarfile, io, os
 
     cap = _max_extracted_bytes()
     name = Path(filename).name
@@ -344,6 +399,8 @@ def handle_upload_extract(handler):
             s = get_session(session_id)
         except KeyError:
             return j(handler, {'error': 'Session not found'}, status=404)
+        if _reject_invisible_session(handler, s):
+            return True
         session_dir = _session_attachment_dir(session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
         result = extract_archive(file_bytes, filename, session_dir)
@@ -398,6 +455,140 @@ def handle_transcribe(handler):
                 pass
 
 
+def _stt_provider_capability_from_module(stt):
+    """Return (available, provider) for a loaded transcription_tools module."""
+    try:
+        load_cfg = getattr(stt, "_load_stt_config", None)
+        stt_config = load_cfg() if callable(load_cfg) else {}
+        cfg_dict = stt_config if isinstance(stt_config, dict) else {}
+        is_enabled = getattr(stt, "is_stt_enabled", None)
+        if callable(is_enabled) and not is_enabled(stt_config):
+            return False, "none"
+
+        # Some tests and future agent releases expose the provider decision as a
+        # single helper. Use it when the lower-level capability flags are not
+        # available. The current agent module exposes the flags below, so the
+        # normal path mirrors _get_provider() without triggering its lazy local
+        # STT install side effect during a passive web page probe.
+        has_internal_flags = any(
+            hasattr(stt, name)
+            for name in ("_HAS_FASTER_WHISPER", "_HAS_OPENAI", "_HAS_MISTRAL")
+        )
+        get_provider = getattr(stt, "_get_provider", None)
+        if callable(get_provider) and not has_internal_flags:
+            provider = str(get_provider(stt_config) or "none")
+            return provider not in ("", "none"), provider or "none"
+
+        def env(name):
+            getter = getattr(stt, "get_env_value", None)
+            try:
+                if callable(getter):
+                    return str(getter(name) or "").strip()
+            except Exception:
+                return ""
+            return os.getenv(name, "").strip()
+
+        def has_local_command():
+            helper = getattr(stt, "_has_local_command", None)
+            try:
+                return bool(helper()) if callable(helper) else False
+            except Exception:
+                return False
+
+        def has_browser_audio_converter():
+            helper = getattr(stt, "_find_ffmpeg_binary", None)
+            try:
+                return bool(helper()) if callable(helper) else False
+            except Exception:
+                return False
+
+        def has_openai_audio():
+            helper = getattr(stt, "_has_openai_audio_backend", None)
+            try:
+                return bool(helper()) if callable(helper) else False
+            except Exception:
+                return False
+
+        def local_command_available():
+            # The browser sends WebM/Ogg blobs; the local-command path converts
+            # non-WAV input through ffmpeg before invoking the command.
+            return has_local_command() and has_browser_audio_converter()
+
+        def command_provider_available(provider):
+            resolver = getattr(stt, "_resolve_command_stt_provider_config", None)
+            try:
+                return callable(resolver) and resolver(provider, cfg_dict) is not None
+            except Exception:
+                return False
+
+        def resolve_provider(provider):
+            if provider == "local":
+                if bool(getattr(stt, "_HAS_FASTER_WHISPER", False)):
+                    return "local"
+                if local_command_available():
+                    return "local_command"
+                return "none"
+            if provider == "local_command":
+                if local_command_available():
+                    return "local_command"
+                if bool(getattr(stt, "_HAS_FASTER_WHISPER", False)):
+                    return "local"
+                return "none"
+            if provider == "groq":
+                return "groq" if bool(getattr(stt, "_HAS_OPENAI", False)) and bool(env("GROQ_API_KEY")) else "none"
+            if provider == "openai":
+                return "openai" if bool(getattr(stt, "_HAS_OPENAI", False)) and has_openai_audio() else "none"
+            if provider == "mistral":
+                return "mistral" if bool(getattr(stt, "_HAS_MISTRAL", False)) and bool(env("MISTRAL_API_KEY")) else "none"
+            if provider == "xai":
+                try:
+                    from tools.xai_http import resolve_xai_http_credentials
+
+                    return "xai" if resolve_xai_http_credentials().get("api_key") else "none"
+                except Exception:
+                    return "none"
+            if provider == "elevenlabs":
+                return "elevenlabs" if bool(env("ELEVENLABS_API_KEY")) else "none"
+            if command_provider_available(provider):
+                return provider
+            return "none"
+
+        explicit = "provider" in cfg_dict
+        if explicit:
+            configured = str(cfg_dict.get("provider") or "local")
+            provider = resolve_provider(configured)
+            return provider != "none", provider if provider != "none" else configured
+
+        for candidate in ("local", "local_command", "groq", "openai", "mistral", "xai", "elevenlabs"):
+            # Command (custom) STT providers are intentionally omitted from this
+            # auto-detect tuple to mirror the agent's _get_provider() (transcription_tools.py),
+            # which only auto-selects local > groq > openai and never auto-picks a command
+            # provider. A command-backed STT activates only via an explicit stt.provider.
+            # Do NOT add command providers here without matching the agent, or the WebUI
+            # probe will diverge from what the agent actually resolves.
+            provider = resolve_provider(candidate)
+            if provider != "none":
+                return True, provider
+        return False, "none"
+    except Exception:
+        return False, "none"
+
+
+
+def _stt_provider_capability():
+    """Return (available, provider) for a cheap server-side STT capability probe."""
+    try:
+        import tools.transcription_tools as stt
+    except ImportError:
+        return False, "none"
+    return _stt_provider_capability_from_module(stt)
+
+
+def handle_transcribe_capability(handler):
+    available, provider = _stt_provider_capability()
+    return j(handler, {"ok": True, "available": bool(available), "provider": provider})
+
+
 def handle_workspace_upload(handler):
     """Upload a file into a session's workspace directory.
 
@@ -429,6 +620,8 @@ def handle_workspace_upload(handler):
             session = get_session(session_id)
         except KeyError:
             return j(handler, {'error': 'Session not found'}, status=404)
+        if _reject_invisible_session(handler, session):
+            return True
 
         # Resolve workspace root from session
         workspace = resolve_trusted_workspace(session.workspace)
@@ -552,6 +745,7 @@ def handle_workspace_upload(handler):
                     })
                     continue
 
+            sidecar = _write_office_upload_sidecar(workspace, dest, file_bytes)
             results.append({
                 'filename': dest.name,
                 'path': str(dest),
@@ -559,6 +753,8 @@ def handle_workspace_upload(handler):
                 'mime': mime,
                 'is_image': mime.startswith('image/'),
                 'extracted': False,
+                **({'sidecar': sidecar} if sidecar and 'error' not in sidecar else {}),
+                **({'sidecar_error': sidecar['error']} if sidecar and 'error' in sidecar else {}),
             })
 
         if len(results) == 1:

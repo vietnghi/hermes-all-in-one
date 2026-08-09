@@ -6,6 +6,7 @@ import time
 import pytest
 
 import api.models as models
+import api.routes as routes
 from api.models import SESSIONS, STREAMS, Session, all_sessions
 
 
@@ -15,9 +16,20 @@ def _isolate(tmp_path, monkeypatch):
     session_dir.mkdir()
     index_file = session_dir / "_index.json"
     state_db = tmp_path / "state.db"
+    index_file.write_text("[]", encoding="utf-8")
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", index_file)
     monkeypatch.setattr(models, "_active_state_db_path", lambda: state_db)
+    monkeypatch.setattr(models, "_start_session_index_rebuild_thread", lambda: None)
+
+    def uncached_persisted_session_ids():
+        return frozenset(
+            p.stem
+            for p in models.SESSION_DIR.glob("*.json")
+            if not p.name.startswith("_")
+        )
+
+    monkeypatch.setattr(models, "_persisted_session_ids_snapshot", uncached_persisted_session_ids)
     SESSIONS.clear()
     STREAMS.clear()
     yield state_db
@@ -44,6 +56,27 @@ def _ensure_state_db(path):
         """
     )
     return conn
+
+
+def _ensure_messages_table(conn):
+    conn.execute(
+        """
+        CREATE TABLE messages (
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL
+        )
+        """
+    )
+
+
+def _insert_state_message(conn, sid, *, role, content, timestamp):
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+        (sid, role, content, timestamp),
+    )
+    conn.commit()
 
 
 def _insert_state_row(conn, sid, *, title=None, parent=None, ended_at=None, end_reason=None, started_at=None, source='webui', session_source=None):
@@ -205,6 +238,9 @@ def test_child_of_hidden_compression_segment_exposes_parent_lineage_root(_isolat
         assert child.get("relationship_type") == "child_session"
         assert child.get("parent_session_id") == "lineage_api_tip"
         assert child.get("_parent_lineage_root_id") == "lineage_api_root"
+        assert child.get("_parent_lineage_tip_id") == "lineage_api_tip"
+        serialized = routes._sidebar_session_response_item(child, redact_enabled=False)
+        assert serialized.get("_parent_lineage_tip_id") == "lineage_api_tip"
         assert "_lineage_root_id" not in child
     finally:
         conn.close()
@@ -306,6 +342,54 @@ def test_state_db_webui_source_overrides_stale_cli_json_metadata(_isolate):
         conn.close()
 
 
+def test_sessions_route_keeps_state_db_webui_row_with_stale_cli_json_when_cli_hidden(_isolate, monkeypatch):
+    """The hot route must apply state.db source correction before CLI filtering."""
+    conn = _ensure_state_db(_isolate)
+    t0 = time.time() - 100
+    try:
+        session = Session(
+            session_id="lineage_api_route_stale_cli_source",
+            title="WebUI Chatnachrichten verschwinden nach Neustart #9",
+            messages=[{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
+            updated_at=t0,
+            is_cli_session=True,
+            source_tag="cli",
+            raw_source="cli",
+            session_source="cli",
+            source_label="CLI",
+        )
+        session.save(touch_updated_at=False)
+        _insert_state_row(
+            conn,
+            "lineage_api_route_stale_cli_source",
+            source="webui",
+            started_at=t0,
+        )
+
+        monkeypatch.setattr(routes, "all_sessions", models.all_sessions)
+        monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", models._enrich_sidebar_lineage_metadata)
+        monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _sessions: False)
+
+        payload = routes._build_session_list_cache_payload(
+            active_profile="default",
+            all_profiles=False,
+            show_cli_sessions=False,
+            show_previous_messaging_sessions=False,
+            show_cron_sessions=False,
+            include_archived=False,
+        )
+
+        rows = {row["session_id"]: row for row in payload["sessions"]}
+        row = rows["lineage_api_route_stale_cli_source"]
+        assert row["source_tag"] == "webui"
+        assert row["raw_source"] == "webui"
+        assert row["session_source"] == "webui"
+        assert row["source_label"] == "WebUI"
+        assert row["is_cli_session"] is False
+    finally:
+        conn.close()
+
+
 def test_generic_webui_title_gets_read_only_state_db_display_title(_isolate):
     """Sidebar rows can display the fresher state.db title without mutating JSON."""
     conn = _ensure_state_db(_isolate)
@@ -328,6 +412,194 @@ def test_generic_webui_title_gets_read_only_state_db_display_title(_isolate):
         conn.close()
 
 
+def test_generic_subagent_title_gets_goal_display_title(_isolate):
+    conn = _ensure_state_db(_isolate)
+    _ensure_messages_table(conn)
+    t0 = time.time() - 100
+    try:
+        _save_webui_session("lineage_api_subagent_goal", title="Subagent Session", updated_at=t0)
+        _insert_state_row(
+            conn,
+            "lineage_api_subagent_goal",
+            title="Subagent Session",
+            source="subagent",
+            started_at=t0,
+        )
+        _insert_state_message(
+            conn,
+            "lineage_api_subagent_goal",
+            role="user",
+            content="Find the root cause of the failing sidebar test",
+            timestamp=t0 + 1,
+        )
+
+        row = {row["session_id"]: row for row in all_sessions(include_lineage_metadata=False)}["lineage_api_subagent_goal"]
+
+        assert row["title"] == "Subagent Session"
+        assert row["display_title"] == "Find the root cause of the failing sidebar test"
+    finally:
+        conn.close()
+
+
+def test_custom_subagent_title_stays_authoritative(_isolate):
+    conn = _ensure_state_db(_isolate)
+    _ensure_messages_table(conn)
+    t0 = time.time() - 100
+    try:
+        _save_webui_session("lineage_api_subagent_custom", title="Investigate auth", updated_at=t0)
+        _insert_state_row(
+            conn,
+            "lineage_api_subagent_custom",
+            title="Investigate auth",
+            source="subagent",
+            started_at=t0,
+        )
+        _insert_state_message(
+            conn,
+            "lineage_api_subagent_custom",
+            role="user",
+            content="A different goal",
+            timestamp=t0 + 1,
+        )
+
+        row = {row["session_id"]: row for row in all_sessions(include_lineage_metadata=False)}["lineage_api_subagent_custom"]
+
+        assert row["title"] == "Investigate auth"
+        assert "display_title" not in row
+    finally:
+        conn.close()
+
+
+def test_generic_subagent_title_falls_back_without_first_user_message(_isolate):
+    conn = _ensure_state_db(_isolate)
+    _ensure_messages_table(conn)
+    t0 = time.time() - 100
+    try:
+        _save_webui_session("lineage_api_subagent_empty", title="Subagent Session", updated_at=t0)
+        _insert_state_row(
+            conn,
+            "lineage_api_subagent_empty",
+            title="Subagent Session",
+            source="subagent",
+            started_at=t0,
+        )
+        _insert_state_message(
+            conn,
+            "lineage_api_subagent_empty",
+            role="assistant",
+            content="Only assistant output",
+            timestamp=t0 + 1,
+        )
+
+        row = {row["session_id"]: row for row in all_sessions(include_lineage_metadata=False)}["lineage_api_subagent_empty"]
+
+        assert row["title"] == "Subagent Session"
+        assert "display_title" not in row
+    finally:
+        conn.close()
+
+
+def test_generic_subagent_title_skips_null_first_user_message(_isolate):
+    conn = _ensure_state_db(_isolate)
+    _ensure_messages_table(conn)
+    t0 = time.time() - 100
+    try:
+        _save_webui_session("lineage_api_subagent_null_first", title="Subagent Session", updated_at=t0)
+        _insert_state_row(
+            conn,
+            "lineage_api_subagent_null_first",
+            title="Subagent Session",
+            source="subagent",
+            started_at=t0,
+        )
+        _insert_state_message(
+            conn,
+            "lineage_api_subagent_null_first",
+            role="user",
+            content=None,
+            timestamp=t0 + 1,
+        )
+        _insert_state_message(
+            conn,
+            "lineage_api_subagent_null_first",
+            role="user",
+            content="Recover the next usable delegated title",
+            timestamp=t0 + 2,
+        )
+
+        row = {row["session_id"]: row for row in all_sessions(include_lineage_metadata=False)}["lineage_api_subagent_null_first"]
+
+        assert row["title"] == "Subagent Session"
+        assert row["display_title"] == "Recover the next usable delegated title"
+    finally:
+        conn.close()
+
+
+def test_generic_subagent_title_respects_sidebar_override_cap(_isolate, monkeypatch):
+    conn = _ensure_state_db(_isolate)
+    _ensure_messages_table(conn)
+    older = time.time() - 200
+    newer = time.time() - 100
+    try:
+        monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "1")
+        _save_webui_session("lineage_api_subagent_old", title="Subagent Session", updated_at=older)
+        _save_webui_session("lineage_api_subagent_new", title="Subagent Session", updated_at=newer)
+        _insert_state_row(
+            conn,
+            "lineage_api_subagent_old",
+            title="Subagent Session",
+            source="subagent",
+            started_at=older,
+        )
+        _insert_state_row(
+            conn,
+            "lineage_api_subagent_new",
+            title="Subagent Session",
+            source="subagent",
+            started_at=newer,
+        )
+        _insert_state_message(
+            conn,
+            "lineage_api_subagent_old",
+            role="user",
+            content="Older delegated title",
+            timestamp=older + 1,
+        )
+        _insert_state_message(
+            conn,
+            "lineage_api_subagent_new",
+            role="user",
+            content="Newest delegated title",
+            timestamp=newer + 1,
+        )
+
+        rows = {row["session_id"]: row for row in all_sessions(include_lineage_metadata=False)}
+
+        assert rows["lineage_api_subagent_new"]["display_title"] == "Newest delegated title"
+        assert "display_title" not in rows["lineage_api_subagent_old"]
+    finally:
+        conn.close()
+def test_generic_subagent_title_falls_back_without_messages_table(_isolate):
+    conn = _ensure_state_db(_isolate)
+    t0 = time.time() - 100
+    try:
+        _save_webui_session("lineage_api_subagent_no_messages", title="Subagent Session", updated_at=t0)
+        _insert_state_row(
+            conn,
+            "lineage_api_subagent_no_messages",
+            title="Subagent Session",
+            source="subagent",
+            started_at=t0,
+        )
+
+        row = {row["session_id"]: row for row in all_sessions(include_lineage_metadata=False)}["lineage_api_subagent_no_messages"]
+
+        assert row["title"] == "Subagent Session"
+        assert "display_title" not in row
+    finally:
+        conn.close()
+
+
 def test_state_db_display_title_does_not_override_custom_json_title(_isolate):
     """Manual/custom JSON titles stay authoritative even when state.db differs."""
     conn = _ensure_state_db(_isolate)
@@ -346,5 +618,78 @@ def test_state_db_display_title_does_not_override_custom_json_title(_isolate):
         assert row["title"] == "Customer escalation notes"
         assert "display_title" not in row
         assert "_state_db_title" not in row
+    finally:
+        conn.close()
+
+
+def test_sessions_route_preserves_visible_child_lineage_when_archived_parent_filtered(_isolate, monkeypatch):
+    """Default /api/sessions omits archived rows but keeps their lineage metadata.
+
+    The route builds the hot sidebar payload with archived rows filtered out by
+    default. A visible continuation child still needs lineage metadata from its
+    archived parent so the client can collapse/display the logical conversation
+    correctly.
+    """
+    conn = _ensure_state_db(_isolate)
+    t0 = time.time() - 100
+    try:
+        archived_parent = _save_webui_session(
+            "lineage_api_archived_parent",
+            title="Hermes WebUI",
+            updated_at=t0,
+        )
+        archived_parent.archived = True
+        archived_parent.save(touch_updated_at=False)
+        _save_webui_session(
+            "lineage_api_visible_tip",
+            title="Hermes WebUI #2",
+            updated_at=t0 + 10,
+        )
+        _insert_state_row(
+            conn,
+            "lineage_api_archived_parent",
+            started_at=t0,
+            ended_at=t0 + 5,
+            end_reason="compression",
+        )
+        _insert_state_row(
+            conn,
+            "lineage_api_visible_tip",
+            parent="lineage_api_archived_parent",
+            started_at=t0 + 6,
+        )
+
+        monkeypatch.setattr(routes, "all_sessions", models.all_sessions)
+        monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", models._enrich_sidebar_lineage_metadata)
+        monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _sessions: False)
+
+        default_payload = routes._build_session_list_cache_payload(
+            active_profile="default",
+            all_profiles=False,
+            show_cli_sessions=False,
+            show_previous_messaging_sessions=False,
+            show_cron_sessions=False,
+            include_archived=False,
+        )
+
+        assert [row["session_id"] for row in default_payload["sessions"]] == ["lineage_api_visible_tip"]
+        assert default_payload["archived_count"] == 1
+        tip = default_payload["sessions"][0]
+        assert tip.get("parent_session_id") == "lineage_api_archived_parent"
+        assert tip.get("_lineage_root_id") == "lineage_api_archived_parent"
+        assert tip.get("_compression_segment_count") == 2
+
+        archived_payload = routes._build_session_list_cache_payload(
+            active_profile="default",
+            all_profiles=False,
+            show_cli_sessions=False,
+            show_previous_messaging_sessions=False,
+            show_cron_sessions=False,
+            include_archived=True,
+        )
+        assert [row["session_id"] for row in archived_payload["sessions"]] == [
+            "lineage_api_visible_tip",
+            "lineage_api_archived_parent",
+        ]
     finally:
         conn.close()
