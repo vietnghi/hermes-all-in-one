@@ -32,6 +32,14 @@
       </aside>
 
       <main class="main">
+        {% if admin_auth_bypassed %}
+        <div class="insecure-banner" role="alert">
+          <strong>Admin authentication is disabled.</strong>
+          <code>HERMES_ALLOW_INSECURE_ADMIN</code> is on and no admin password is set, so anyone who can
+          reach this URL has full control — provider API keys, channel bot tokens, and pairing approvals.
+          Set <code>HERMES_ADMIN_PASSWORD</code> and remove the override before exposing this deployment.
+        </div>
+        {% endif %}
         <header class="topbar">
           <div>
             <h1>Hermes Control Plane</h1>

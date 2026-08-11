@@ -175,3 +175,14 @@ input, select {
   .cards-grid, .two-up, .two-columns { grid-template-columns: 1fr; }
   .topbar { flex-direction: column; }
 }
+
+.insecure-banner {
+  margin: 24px 32px 0; padding: 14px 18px; border-radius: 12px;
+  border: 1px solid var(--danger); background: rgba(239, 68, 68, 0.12);
+  color: var(--text); font-size: 14px; line-height: 1.5;
+}
+.insecure-banner strong { color: var(--danger); }
+.insecure-banner code {
+  background: var(--bg-muted); border: 1px solid var(--border);
+  border-radius: 6px; padding: 1px 5px; font-size: 13px;
+}

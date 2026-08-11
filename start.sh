@@ -38,6 +38,22 @@ if [ -d "/app/vendor/hermes-agent/optional-skills" ]; then
   cp -rn /app/vendor/hermes-agent/optional-skills/. "${HERMES_HOME}/optional-skills/" 2>/dev/null || true
 fi
 
+ADMIN_SECRET="${HERMES_ADMIN_PASSWORD:-${HERMES_WEBUI_PASSWORD:-}}"
+MIN_LEN="${HERMES_ADMIN_MIN_PASSWORD_LENGTH:-12}"
+if [ -z "${ADMIN_SECRET}" ] || [ "${#ADMIN_SECRET}" -lt "${MIN_LEN}" ]; then
+  case "${HERMES_ALLOW_INSECURE_ADMIN:-}" in
+    1|true|TRUE|yes|on)
+      echo "[start] *** SECURITY WARNING ***"
+      echo "[start] No usable admin password and HERMES_ALLOW_INSECURE_ADMIN is on."
+      echo "[start] /admin is served WITHOUT authentication. Anyone who can reach this URL can"
+      echo "[start] write provider API keys, channel bot tokens, and approve chat pairings."
+      ;;
+    *)
+      echo "[start] /admin is LOCKED — set HERMES_ADMIN_PASSWORD (min ${MIN_LEN} chars) and redeploy."
+      ;;
+  esac
+fi
+
 echo "[start] launching Hermes control plane on 0.0.0.0:${PORT:-8787}"
 echo "[start] internal WebUI target ${CONTROL_PLANE_INTERNAL_WEBUI_HOST}:${CONTROL_PLANE_INTERNAL_WEBUI_PORT}"
 echo "[start] gateway autostart mode ${HERMES_GATEWAY_AUTOSTART}"
