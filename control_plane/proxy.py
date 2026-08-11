@@ -33,7 +33,11 @@ async def proxy_to_webui(request: Request, path: str) -> Response:
             continue
         headers[key] = value
     headers["X-Forwarded-Host"] = request.headers.get("host", "")
-    headers["X-Forwarded-Proto"] = request.url.scheme
+    # Preserve the edge proxy's view of the client scheme. Railway terminates TLS,
+    # so request.url.scheme here is "http" — overwriting would tell the WebUI the
+    # client is on plaintext and make it drop the `secure` flag on its own cookies.
+    inbound_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    headers["X-Forwarded-Proto"] = inbound_proto or request.url.scheme
     headers["X-Real-Host"] = request.headers.get("host", "")
 
     body = await request.body()

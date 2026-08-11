@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
@@ -13,17 +15,25 @@ from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
 from control_plane.auth import (
-    ADMIN_COOKIE_NAME,
+    admin_auth_bypassed,
+    admin_auth_configured,
     admin_auth_enabled,
     admin_cookie_value,
+    admin_password_state,
     admin_unauthorized_response,
     clear_admin_cookie,
+    clear_login_failures,
     clear_admin_session,
     create_admin_session,
     is_admin_authenticated,
+    login_throttled,
+    record_login_failure,
+    request_is_secure,
+    set_admin_cookie,
     verify_admin_password,
 )
 from control_plane.config import (
+    ADMIN_MIN_PASSWORD_LENGTH,
     ADMIN_PASSWORD,
     CHANNEL_ENV_KEYS,
     HERMES_CONFIG_PATH,
@@ -100,7 +110,32 @@ def _admin_required(request: Request) -> Response | None:
     return admin_unauthorized_response(request)
 
 
+def _log_admin_auth_state() -> None:
+    state = admin_password_state()
+    if state == "ok":
+        return
+    reason = (
+        f"HERMES_ADMIN_PASSWORD is shorter than {ADMIN_MIN_PASSWORD_LENGTH} characters"
+        if state == "too_short"
+        else "neither HERMES_ADMIN_PASSWORD nor HERMES_WEBUI_PASSWORD is set"
+    )
+    if admin_auth_bypassed():
+        print(
+            f"[control-plane] SECURITY WARNING: {reason}, and HERMES_ALLOW_INSECURE_ADMIN is on. "
+            "/admin is served WITHOUT authentication — anyone who can reach this URL can write "
+            "provider API keys, channel bot tokens, and approve chat pairings.",
+            flush=True,
+        )
+    else:
+        print(
+            f"[control-plane] /admin is LOCKED: {reason}. "
+            "Set HERMES_ADMIN_PASSWORD and redeploy to unlock the control plane.",
+            flush=True,
+        )
+
+
 async def on_startup() -> None:
+    _log_admin_auth_state()
     ensure_runtime_dirs()
     webui_manager.start()
     webui_manager.wait_until_ready(timeout=30)
@@ -129,9 +164,47 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse(payload, status_code=200 if webui_ok else 503)
 
 
-async def admin_login_page(request: Request) -> HTMLResponse:
+_LOGIN_PAGE_CSS = """
+    body{font-family:Inter,system-ui,sans-serif;background:#0f172a;color:#e5e7eb;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    form,div.notice{background:#111827;border:1px solid #1f2937;border-radius:16px;padding:32px;min-width:320px;max-width:520px;box-shadow:0 24px 80px rgba(0,0,0,.35)}
+    h1{margin:0 0 8px;font-size:24px}p{margin:0 0 24px;color:#94a3b8}input{width:100%;padding:12px 14px;border-radius:12px;border:1px solid #334155;background:#020617;color:#e5e7eb;box-sizing:border-box}button{margin-top:16px;width:100%;padding:12px 14px;border:0;border-radius:12px;background:#2563eb;color:#fff;font-weight:600}small{display:block;margin-top:16px;color:#64748b}
+    code{background:#020617;border:1px solid #334155;border-radius:6px;padding:2px 6px;font-size:13px}
+    .warn{color:#fca5a5}
+"""
+
+
+def _setup_required_page(state: str) -> HTMLResponse:
+    """Shown when /admin is locked because no usable password is configured."""
+    if state == "too_short":
+        detail = (
+            f"<p class=\"warn\">The configured admin password is shorter than "
+            f"{ADMIN_MIN_PASSWORD_LENGTH} characters, so it is being ignored.</p>"
+        )
+    else:
+        detail = "<p class=\"warn\">No admin password is configured, so the control plane is locked.</p>"
+    html = f"""
+    <!doctype html>
+    <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hermes Admin — setup required</title>
+    <style>{_LOGIN_PAGE_CSS}</style></head><body><div class="notice">
+    <h1>Setup required</h1>
+    {detail}
+    <p>Set <code>HERMES_ADMIN_PASSWORD</code> (at least {ADMIN_MIN_PASSWORD_LENGTH} characters) in your
+    Railway service variables and redeploy. <code>HERMES_WEBUI_PASSWORD</code> is used as a fallback.</p>
+    <small>Every <code>/admin</code> route stays closed until then — this deployment can write provider
+    API keys, channel bot tokens and pairing approvals, so it is never served unauthenticated by default.
+    For a private, non-public deployment you can set <code>HERMES_ALLOW_INSECURE_ADMIN=1</code> to opt out,
+    at your own risk.</small>
+    </div></body></html>
+    """
+    return HTMLResponse(html, status_code=503)
+
+
+async def admin_login_page(request: Request) -> Response:
     if is_admin_authenticated(request):
         return RedirectResponse(url="/admin", status_code=302)
+    state = admin_password_state()
+    if state != "ok":
+        return _setup_required_page(state)
     html = """
     <!doctype html>
     <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Hermes Admin Login</title>
@@ -147,21 +220,21 @@ async def admin_login_page(request: Request) -> HTMLResponse:
 async def admin_login(request: Request) -> Response:
     from urllib.parse import parse_qs
 
+    if not admin_auth_configured():
+        return _setup_required_page(admin_password_state())
+    if login_throttled(request):
+        return HTMLResponse("Too many failed attempts. Try again later.", status_code=429)
+
     raw = (await request.body()).decode("utf-8", errors="ignore")
     form = {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
     password = str(form.get("password") or "")
     if not verify_admin_password(password):
+        record_login_failure(request)
         return HTMLResponse("Invalid password", status_code=401)
+
+    clear_login_failures(request)
     response = RedirectResponse(url="/admin", status_code=302)
-    response.set_cookie(
-        ADMIN_COOKIE_NAME,
-        create_admin_session(),
-        httponly=True,
-        samesite="lax",
-        max_age=24 * 60 * 60,
-        secure=request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "") == "https",
-        path="/admin",
-    )
+    set_admin_cookie(request, response, create_admin_session())
     return response
 
 
@@ -185,6 +258,7 @@ async def admin_index(request: Request) -> Response:
             "provider_catalog": provider_catalog(),
             "unsupported_provider_note": UNSUPPORTED_PROVIDER_NOTE,
             "admin_auth_enabled": admin_auth_enabled(),
+            "admin_auth_bypassed": admin_auth_bypassed(),
             "has_separate_admin_password": bool(ADMIN_PASSWORD),
         },
     )
@@ -363,4 +437,34 @@ routes = [
     Route("/{path:path}", proxy_catchall, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
 ]
 
-app = Starlette(routes=routes, on_startup=[on_startup], on_shutdown=[on_shutdown])
+class AdminSecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Harden /admin responses. WebUI responses are passed through untouched
+    so the proxied app keeps control of its own headers."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if not request.url.path.startswith("/admin"):
+            return response
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        )
+        # Admin pages carry masked secrets and status — never let a shared cache hold them.
+        response.headers["Cache-Control"] = "no-store"
+        if request_is_secure(request):
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+            )
+        return response
+
+
+app = Starlette(
+    routes=routes,
+    middleware=[Middleware(AdminSecurityHeadersMiddleware)],
+    on_startup=[on_startup],
+    on_shutdown=[on_shutdown],
+)

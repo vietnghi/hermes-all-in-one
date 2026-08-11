@@ -19,6 +19,8 @@ https://your-app.railway.app/admin
 
 Log in with `HERMES_ADMIN_PASSWORD` (or `HERMES_WEBUI_PASSWORD` if admin password isn't set). This is where you set your API key, connect Telegram, and start the gateway.
 
+> **`/admin` is locked until you set a password.** It can write provider API keys, channel bot tokens and pairing approvals, so with no password configured every `/admin` route answers `503` instead of letting anyone in. Set `HERMES_ADMIN_PASSWORD` (12+ characters) and redeploy.
+
 ---
 
 ## What is this?
@@ -368,7 +370,18 @@ Full scheduling docs: [hermes-agent.nousresearch.com/docs/user-guide/features/cr
 | Variable | Description |
 |----------|-------------|
 | `HERMES_WEBUI_PASSWORD` | Password for the WebUI at `/` |
-| `HERMES_ADMIN_PASSWORD` | Password for `/admin` (falls back to WebUI password if unset) |
+| `HERMES_ADMIN_PASSWORD` | Password for `/admin` (falls back to WebUI password if unset). Without it `/admin` stays locked. |
+
+### Admin hardening (optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HERMES_ADMIN_MIN_PASSWORD_LENGTH` | `12` | Shorter passwords are treated as unset |
+| `HERMES_ADMIN_LOGIN_MAX_ATTEMPTS` | `10` | Failed logins per IP before a `429` |
+| `HERMES_ADMIN_LOGIN_WINDOW_SECONDS` | `300` | Rolling window for the throttle |
+| `HERMES_ADMIN_SESSION_TTL` | `86400` | Admin session lifetime in seconds |
+| `HERMES_TRUST_PROXY_HEADERS` | `1` | Trust `X-Forwarded-For`/`-Proto`. Set `0` if clients reach the control plane directly |
+| `HERMES_ALLOW_INSECURE_ADMIN` | unset | **Dangerous.** Serves `/admin` with no auth when no password is set. Private deployments only |
 
 ### AI Provider (set via `/admin` UI or manually)
 
@@ -558,7 +571,7 @@ Keep `HERMES_GATEWAY_AUTOSTART=off`, deploy once, and use the WebUI exclusively 
 
 **The gateway health check is time-based, not HTTP.** Hermes gateway is a Telegram bot process — it's healthy if it's been running without crashing for ≥3 seconds. No HTTP endpoint to probe.
 
-**Password protect everything before sharing the URL.** Both `HERMES_WEBUI_PASSWORD` and `HERMES_ADMIN_PASSWORD` should be set before the service is public.
+**Password protect everything before sharing the URL.** Both `HERMES_WEBUI_PASSWORD` and `HERMES_ADMIN_PASSWORD` should be set before the service is public. The control plane now enforces the admin half itself — no password means `/admin` is locked, not open.
 
 ---
 

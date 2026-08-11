@@ -29,6 +29,25 @@ ADMIN_USERNAME = os.getenv("HERMES_ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("HERMES_ADMIN_PASSWORD", os.getenv("HERMES_WEBUI_PASSWORD", "")).strip()
 ADMIN_SESSION_TTL = int(os.getenv("HERMES_ADMIN_SESSION_TTL", str(24 * 60 * 60)))
 ADMIN_COOKIE_NAME = "hermes_admin_session"
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+# Escape hatch for local/private deployments only. When no admin password is
+# configured the control plane fails CLOSED (every /admin route is refused);
+# setting this to 1 restores the old fail-open behaviour and leaves the whole
+# admin surface — provider keys, channel tokens, pairing approval — unauthenticated.
+ADMIN_ALLOW_INSECURE = _env_flag("HERMES_ALLOW_INSECURE_ADMIN")
+# Shortest admin password accepted at startup. Anything shorter is treated as
+# "not configured" so a one-character password can't stand in for real auth.
+ADMIN_MIN_PASSWORD_LENGTH = int(os.getenv("HERMES_ADMIN_MIN_PASSWORD_LENGTH", "12"))
+# Login throttle: max failed attempts per client IP inside the rolling window.
+ADMIN_LOGIN_MAX_ATTEMPTS = int(os.getenv("HERMES_ADMIN_LOGIN_MAX_ATTEMPTS", "10"))
+ADMIN_LOGIN_WINDOW_SECONDS = int(os.getenv("HERMES_ADMIN_LOGIN_WINDOW_SECONDS", "300"))
+# Trust X-Forwarded-* from the proxy in front of us (Railway terminates TLS and
+# sets these). Disable when the control plane is exposed directly, or a client
+# can spoof its own source IP for the login throttle.
+TRUST_PROXY_HEADERS = os.getenv("HERMES_TRUST_PROXY_HEADERS", "1").strip().lower() not in {"0", "false", "no", "off"}
 STATUS_CACHE_TTL = float(os.getenv("CONTROL_PLANE_STATUS_CACHE_TTL", "2.0"))
 
 _SUPPORTED_PROVIDER_SETUPS: dict[str, dict[str, Any]] = {
@@ -161,11 +180,26 @@ def save_yaml_config(config_path: Path, config: dict[str, Any]) -> None:
 
 
 def mask_secret(value: str) -> str:
+    """Render a secret as a presence indicator, never as a partial secret.
+
+    Only the last 4 characters survive — enough to tell two keys apart in the
+    UI, not enough to narrow a brute force. The length is deliberately not
+    disclosed.
+    """
     if not value:
         return ""
     if len(value) <= 8:
-        return "***"
-    return value[:4] + "…" + value[-2:]
+        return "••••"
+    return "••••" + value[-4:]
+
+
+def is_masked_secret(value: str) -> bool:
+    """True when a submitted value is one of our own masks echoed back.
+
+    Guards against a client that GETs the masked snapshot and POSTs it
+    straight back, which would otherwise overwrite a real token with dots.
+    """
+    return value.strip().startswith("••••")
 
 
 def extract_model_config(config: dict[str, Any]) -> dict[str, str]:
@@ -202,6 +236,8 @@ def apply_provider_setup(
         raise ValueError("model is required")
     if not api_key:
         raise ValueError("api_key is required")
+    if is_masked_secret(api_key):
+        raise ValueError("api_key looks like a masked placeholder — send the real key or omit the field")
 
     config = load_yaml_config(config_path)
     model_cfg = config.get("model") if isinstance(config.get("model"), dict) else {}
@@ -264,7 +300,11 @@ def should_autostart_gateway(
 
 def save_channel_values(env_path: Path, updates: dict[str, str | None]) -> dict[str, str]:
     allowed = set(CHANNEL_ENV_KEYS) | GATEWAY_EXTRA_KEYS
-    filtered = {key: value for key, value in updates.items() if key in allowed}
+    filtered = {
+        key: value
+        for key, value in updates.items()
+        if key in allowed and not (isinstance(value, str) and is_masked_secret(value))
+    }
     write_env_updates(env_path, filtered)
     return load_env_file(env_path)
 
